@@ -80,6 +80,7 @@ internal static class LayoutTests
             Get<Grid>(window, "NetworkPage").Visibility = Visibility.Collapsed;
             Get<Grid>(window, "DevicePage").Visibility = Visibility.Visible;
             Get<TextBlock>(window, "ShareMessage").Text = FullError;
+            Get<StackPanel>(window, "AccountConnectionPanel").Visibility = Visibility.Visible;
             Get<Button>(window, "ConnectButton").Visibility = Visibility.Visible;
             Layout(window, width, height);
             Check(Get<Grid>(window, "ShareDetail").ActualWidth >= 650, size + " dedicated computer panel uses the full content width");
@@ -148,6 +149,21 @@ internal static class LayoutTests
             object device = Activator.CreateInstance(deviceType);
             deviceType.GetProperty("IsLocal").SetValue(device, true, null);
             controllerType.GetField("selected", BindingFlags.Instance | BindingFlags.NonPublic).SetValue(controller, device);
+            shares.Clear();
+            controllerType.GetField("browserError", BindingFlags.Instance | BindingFlags.NonPublic).SetValue(controller, 1219);
+            controllerType.GetField("browserMessage", BindingFlags.Instance | BindingFlags.NonPublic).SetValue(controller, "Já existe uma conexão com outra conta.");
+            render.Invoke(controller, null);
+            Check(Get<Button>(window, "SwitchAccountButton").Visibility == Visibility.Visible && Get<Button>(window, "ConnectButton").Visibility == Visibility.Collapsed,
+                "credential conflict offers account switching instead of repeating the same failed login");
+            Check(Get<StackPanel>(window, "AccountConnectionPanel").Visibility == Visibility.Visible && Get<Border>(window, "BrowserActions").Visibility == Visibility.Collapsed,
+                "login guidance uses the empty view without unrelated disabled file actions");
+            controllerType.GetField("browserError", BindingFlags.Instance | BindingFlags.NonPublic).SetValue(controller, 1326);
+            render.Invoke(controller, null);
+            Check(Get<Button>(window, "ConnectButton").Visibility == Visibility.Visible && Get<Button>(window, "SwitchAccountButton").Visibility == Visibility.Collapsed,
+                "incorrect credentials retain the ordinary Windows login action");
+            Check(!string.IsNullOrWhiteSpace(Get<Button>(window, "CopyAccountButton").Content.ToString()) && Get<TextBox>(window, "RemoteUserName").MaxLength == 256,
+                "current-PC account can be copied and remote username input is bounded");
+            controllerType.GetField("browserError", BindingFlags.Instance | BindingFlags.NonPublic).SetValue(controller, 0);
             Type entryType = assembly.GetType("RedeClara.FolderEntry", true);
             var entries = (IList)Activator.CreateInstance(typeof(System.Collections.Generic.List<>).MakeGenericType(entryType));
             object entry = Activator.CreateInstance(entryType);

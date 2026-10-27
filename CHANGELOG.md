@@ -1,5 +1,13 @@
 # Histórico de versões
 
+## 0.1.1 — 27/10/2026
+
+- Novo botão **Trocar conta** para resolver conflito de credenciais do Windows (1219), encerrando somente conexões ociosas com o computador selecionado.
+- Troca sem forçar o fechamento de arquivos ou apagar a configuração de unidades mapeadas.
+- Campo identificado para o usuário do computador remoto e ajuda sobre conta local, conta Microsoft, senha e PIN. A senha continua no diálogo do Windows.
+- Dados deste computador mais claros e ação para copiar o usuário.
+- Ações de arquivo são ocultadas enquanto o app mostra o estado de conexão.
+
 ## 0.1.0 — 27/10/2026
 
 Primeiro release do Rede Clara para Windows x64.

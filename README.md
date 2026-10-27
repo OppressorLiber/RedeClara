@@ -19,6 +19,7 @@ Windows 10/11 x64 com .NET Framework 4.8 e Windows PowerShell 5.1. Não exige Py
 - Enumera pastas SMB com `NetShareEnum`, incluindo opção para mostrar compartilhamentos administrativos.
 - Abre uma tela ampla do computador selecionado, com pastas em cartões, filtro, caminho e navegação por subpastas e arquivos, sem executar arquivos remotamente.
 - Abre pastas no Explorer, copia caminhos e usa o diálogo nativo de mapeamento de unidade.
+- Resolve conflitos de conta com **Trocar conta**: encerra somente conexões ociosas com o computador selecionado e abre o login do Windows novamente. Conexões com arquivos em uso são preservadas.
 - Prepara os serviços de descoberta e compartilhamento; cria regras próprias de firewall para a interface escolhida, rede privada e sub-rede local.
 - Faz diagnóstico, registra o estado anterior e permite desfazer os ajustes registrados pelo app. Não apaga os compartilhamentos do usuário ao desfazer a preparação.
 - Compartilha uma pasta escolhida, somente para a conta exibida, com leitura ou leitura/gravação. Preserva compartilhamentos existentes e guarda o estado anterior das permissões.

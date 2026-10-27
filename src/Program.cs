@@ -163,6 +163,9 @@ namespace RedeClara
             Wire("OpenShare", delegate { OpenSelectedInWindows(); });
             Wire("CopyPath", delegate { if (CurrentPath() != null) { Clipboard.SetText(CurrentPath()); Footer("Caminho copiado."); } });
             Wire("ConnectButton", async delegate { await Authenticate(); });
+            Wire("SwitchAccountButton", async delegate { await SwitchAccount(); });
+            Wire("CopyAccountButton", delegate { Clipboard.SetText(Environment.UserDomainName + @"\" + Environment.UserName); Footer("Usuário deste computador copiado. Use-o para entrar neste PC a partir do outro."); });
+            Wire("AccountSettingsButton", delegate { Process.Start(new ProcessStartInfo("ms-settings:yourinfo") { UseShellExecute = true }); });
             Wire("MapDrive", MapDrive);
             Wire("ExportButton", Export);
             Wire("CheckUpdatesButton", async delegate { await CheckUpdates(); });
@@ -171,6 +174,7 @@ namespace RedeClara
             C<TextBox>("FilterBox").TextChanged += delegate { CollectionViewSource.GetDefaultView(devices).Refresh(); };
             C<TextBox>("DeviceFilterBox").TextChanged += delegate { if (!browserBusy) RenderShares(); };
             C<TextBox>("ManualHost").KeyDown += async delegate(object s, KeyEventArgs e) { if (e.Key == Key.Enter) { e.Handled = true; await AddHost(); } };
+            C<TextBox>("RemoteUserName").KeyDown += async delegate(object s, KeyEventArgs e) { if (e.Key == Key.Enter) { e.Handled = true; if (browserError == 1219) await SwitchAccount(); else await Authenticate(); } };
             C<CheckBox>("ShowHidden").Checked += delegate { RenderShares(); };
             C<CheckBox>("ShowHidden").Unchecked += delegate { RenderShares(); };
             C<ListBox>("DeviceList").ItemsSource = devices;
@@ -185,6 +189,7 @@ namespace RedeClara
                 var device = C<ListBox>("DeviceList").SelectedItem as DeviceInfo;
                 if (device == null) return;
                 selected = device;
+                C<TextBox>("RemoteUserName").Clear();
                 Navigate("DevicePage", "NavNetwork");
                 await LoadShares();
             };
@@ -398,6 +403,7 @@ namespace RedeClara
             shares = new List<ShareInfo>();
             Text("SelectedHost", target.DisplayName);
             Text("SelectedAddress", target.Address + " · " + target.Status);
+            Text("RemoteAccountLabel", "Usuário do computador " + target.DisplayName);
             ShareResult result;
             try { result = Program.Json.Deserialize<ShareResult>(await RunBrowserHelper("--enum", target.Target)); }
             catch (Exception ex) { result = new ShareResult { ErrorCode = -1, Message = ex.Message }; }
@@ -442,6 +448,7 @@ namespace RedeClara
             C<ListBox>("ShareList").ItemTemplate = (DataTemplate)Window.FindResource(path == null ? "ShareTemplate" : "FolderTemplate");
             C<ScrollViewer>("ShareEmptyHost").Visibility = Visibility.Visible;
             C<Button>("ConnectButton").Visibility = Visibility.Collapsed;
+            C<Button>("SwitchAccountButton").Visibility = Visibility.Collapsed;
             Text("BrowseLocation", path ?? @"\\" + selected.Target);
             C<TextBlock>("BrowseLocation").ToolTip = path ?? @"\\" + selected.Target;
             Text("FolderCount", path == null ? "Procurando pastas compartilhadas…" : "Consultando apenas esta pasta…");
@@ -509,7 +516,11 @@ namespace RedeClara
             Text("ShareMessage", message);
             Text("FolderCount", count + (browsePath == null ? " pasta(s) compartilhada(s)" : " item(ns)") + (count != total ? " de " + total : "") + (browserTruncated ? " · limite de 1.000 itens; refine a organização da pasta" : "") + (browserError != 0 ? " · consulta com erro" : ""));
             C<ScrollViewer>("ShareEmptyHost").Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
-            C<Button>("ConnectButton").Visibility = empty && (browserError != 0 || (browsePath == null && shares.Count == 0 && term.Length == 0)) ? Visibility.Visible : Visibility.Collapsed;
+            bool needsAccount = empty && (browserError != 0 || (browsePath == null && shares.Count == 0 && term.Length == 0));
+            C<StackPanel>("AccountConnectionPanel").Visibility = needsAccount ? Visibility.Visible : Visibility.Collapsed;
+            C<Button>("ConnectButton").Visibility = needsAccount && browserError != 1219 ? Visibility.Visible : Visibility.Collapsed;
+            C<Button>("SwitchAccountButton").Visibility = needsAccount && browserError == 1219 ? Visibility.Visible : Visibility.Collapsed;
+            C<Border>("BrowserActions").Visibility = empty ? Visibility.Collapsed : Visibility.Visible;
             UpdateShareActions();
         }
         string CurrentPath()
@@ -536,6 +547,8 @@ namespace RedeClara
             C<Button>("UpFolderButton").IsEnabled = ready && browsePath != null;
             C<Button>("RefreshShares").IsEnabled = ready && selected != null;
             C<Button>("ConnectButton").IsEnabled = ready;
+            C<Button>("SwitchAccountButton").IsEnabled = ready;
+            C<TextBox>("RemoteUserName").IsEnabled = ready;
             C<TextBox>("DeviceFilterBox").IsEnabled = ready;
             C<CheckBox>("ShowHidden").Visibility = browsePath == null ? Visibility.Visible : Visibility.Collapsed;
             C<CheckBox>("ShowHidden").IsEnabled = ready;
@@ -571,18 +584,55 @@ namespace RedeClara
             UpdateShareActions();
             try
             {
-                int code = NativeNetwork.Authenticate(selected.Target, Window);
+                string account = C<TextBox>("RemoteUserName").Text.Trim();
+                int code = NativeNetwork.Authenticate(selected.Target, Window, account.Length == 0 ? null : account);
                 if (code == 0) { Footer("Conta conectada pelo Windows. Atualizando as pastas…"); authenticating = false; await RefreshBrowser(); }
-                else if (code == 1223) Footer("Entrada cancelada. As conexões existentes foram preservadas.");
+                else if (code == 1223)
+                {
+                    browserError = 1223;
+                    browserMessage = "Entrada cancelada. Você pode tentar entrar novamente com a conta deste computador.";
+                    RenderShares();
+                    Footer(browserMessage);
+                }
                 else
                 {
                     browserError = code;
-                    browserMessage = code == 1219 ? "O Windows já tem uma conexão com este computador usando outra conta. Encerre essa conexão no Windows antes de trocar de conta." : "O Windows retornou " + code + ": " + new Win32Exception(code).Message;
+                    browserMessage = code == 1219 ? "Já existe uma conexão com outra conta. Use Trocar conta para encerrar os acessos ociosos a este computador e entrar novamente." : code == 1326 || code == 86 ? "O computador recusou o usuário ou a senha. Informe a conta do computador selecionado; o PIN que desbloqueia o Windows não é a senha de rede." : "O Windows retornou " + code + ": " + new Win32Exception(code).Message;
                     RenderShares();
                     Footer(browserMessage);
                 }
             }
             catch (Exception ex) { Footer("Não foi possível entrar: " + ex.Message); }
+            finally { authenticating = false; UpdateShareActions(); }
+        }
+        async Task SwitchAccount()
+        {
+            if (selected == null || browserBusy || authenticating) return;
+            var target = selected;
+            authenticating = true;
+            UpdateShareActions();
+            Footer("Encerrando somente os acessos ociosos a " + target.DisplayName + "…");
+            try
+            {
+                var result = await Task.Run(() => SmbConnections.DisconnectIdleServer(target.Target));
+                if (closing || selected != target) return;
+                if (!result.Success)
+                {
+                    browserError = 1219;
+                    browserMessage = result.Message;
+                    RenderShares();
+                    Footer(result.Message);
+                    return;
+                }
+                browserError = 0;
+                browserMessage = "Conexão anterior encerrada. Entre com a conta deste computador no diálogo do Windows.";
+                Footer(browserMessage);
+                authenticating = false;
+                // Authenticate immediately: enumerating shares here would create
+                // another implicit connection with the previous Windows identity.
+                await Authenticate();
+            }
+            catch (Exception ex) { Footer("Não foi possível trocar a conta: " + ex.Message); }
             finally { authenticating = false; UpdateShareActions(); }
         }
         void BrowseFolder()
@@ -732,12 +782,12 @@ namespace RedeClara
         static extern int WNetConnectionDialog1Native(ref CONNECTDLGSTRUCT value);
         [DllImport("mpr.dll", CharSet = CharSet.Unicode, EntryPoint = "WNetAddConnection3W")]
         static extern int WNetAddConnection3(IntPtr owner, ref NETRESOURCE resource, string password, string userName, uint flags);
-        internal static int Authenticate(string host, Window owner)
+        internal static int Authenticate(string host, Window owner, string userName)
         {
             var resource = new NETRESOURCE { dwType = 0, lpRemoteName = @"\\" + NetworkDiscovery.ValidateHost(host) + @"\IPC$" };
             // Interactive prompt belongs to this process/logon session. No
             // password is read by the app or persisted in its configuration.
-            return WNetAddConnection3(new System.Windows.Interop.WindowInteropHelper(owner).Handle, ref resource, null, null, 0x8 | 0x10 | 0x4);
+            return WNetAddConnection3(new System.Windows.Interop.WindowInteropHelper(owner).Handle, ref resource, null, userName, 0x8 | 0x10 | 0x4);
         }
         internal static int WNetConnectionDialog1(ref NETRESOURCE resource, Window owner)
         {

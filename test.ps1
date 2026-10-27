@@ -28,6 +28,9 @@ try {
     $folders = Build-Test 'FolderBrowserTests' @('src\Models.cs','src\NetworkDiscovery.cs','src\FolderBrowser.cs','tests\FolderBrowserTests.cs')
     & $folders
     if ($LASTEXITCODE -ne 0) { throw 'Falha nos testes de navegação de pastas.' }
+    $connections = Build-Test 'SmbConnectionTests' @('src\Models.cs','src\NetworkDiscovery.cs','src\SmbConnections.cs','tests\SmbConnectionTests.cs')
+    & $connections
+    if ($LASTEXITCODE -ne 0) { throw 'Falha nos testes de troca de conta.' }
     $wpf = @('WPF\WindowsBase.dll','WPF\PresentationCore.dll','WPF\PresentationFramework.dll','System.Xaml.dll','System.Xml.dll') | ForEach-Object { '/reference:'+(Join-Path $framework $_) }
     $layout = Build-Test 'LayoutTests' @('tests\LayoutTests.cs') $wpf
     & $layout (Join-Path $root 'src\MainWindow.xaml') (Join-Path $root 'qa\RedeClara-QA.exe')
