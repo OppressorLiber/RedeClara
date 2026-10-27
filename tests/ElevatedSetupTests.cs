@@ -25,14 +25,16 @@ internal static class ElevatedSetupTests
     static bool fixtureCreated, shareCleaned, prepareAttempted, undoCompleted;
     static AdapterInfo selectedAdapter;
     static bool recoveryRequested;
+    static bool repairRequested;
     static Dictionary<string, object> recoveryReport;
 
     [STAThread]
     static int Main(string[] args)
     {
-        if (args.Length != 1 || (args[0] != "--run" && args[0] != "--recover-and-run")) return 2;
+        if (args.Length != 1 || (args[0] != "--run" && args[0] != "--recover-and-run" && args[0] != "--repair-sharing-firewall-and-run")) return 2;
         recoveryRequested = args[0] == "--recover-and-run";
-        if (recoveryRequested)
+        repairRequested = args[0] == "--repair-sharing-firewall-and-run";
+        if (recoveryRequested || repairRequested)
         {
             try
             {
@@ -73,6 +75,18 @@ internal static class ElevatedSetupTests
                 Require(diagnostic.Success, diagnostic.Message + Environment.NewLine + diagnostic.Details);
                 return diagnostic;
             });
+            if (repairRequested)
+            {
+                Step("Repair only documented Windows sharing firewall deltas, then undo the app's previous preparation", delegate
+                {
+                    object repaired = RepairDocumentedSharingFirewall();
+                    Report["SharingFirewallRepair"] = repaired;
+                    SaveReport();
+                    SetupResult undone = AdminConfigurator.UndoAsync(selectedAdapter).GetAwaiter().GetResult();
+                    Require(undone.Success, undone.Message + Environment.NewLine + undone.Details);
+                    return new { FirewallRepair = repaired, PreviousPreparationUndo = undone };
+                });
+            }
             Dictionary<string, object> before = null;
             Step("Read-only baseline and existing-journal safety guard", delegate
             {
@@ -132,10 +146,15 @@ internal static class ElevatedSetupTests
             });
             Step("CreateShareAsync read-only for current Windows account", delegate
             {
+                Report["FullFpsBeforeShare"] = PowerShell(CommonFunctions() + "\r\nreturn [ordered]@{Rules=@(Get-FpsFirewallSnapshot)}", Parameters());
+                SaveReport();
                 SetupResult result = AdminConfigurator.CreateShareAsync(fixture, shareName, false).GetAwaiter().GetResult();
                 afterShareAcl = Directory.GetAccessControl(fixture, FixtureAclSections).GetSecurityDescriptorSddlForm(FixtureAclSections);
                 Report["AfterShareFixtureAcl"] = afterShareAcl;
                 Require(result.Success, result.Message + Environment.NewLine + result.Details);
+                Report["FullFpsAfterShare"] = PowerShell(CommonFunctions() + "\r\nreturn [ordered]@{Rules=@(Get-FpsFirewallSnapshot)}", Parameters());
+                SaveReport();
+                Require(Equivalent(Report["FullFpsBeforeShare"], Report["FullFpsAfterShare"]), "The complete FPS rule/filter snapshot differs after CreateShareAsync; inspect FullFpsBeforeShare and FullFpsAfterShare.");
                 return result;
             });
             Step("Verify exact SID, read-only share and real local UNC read", delegate
@@ -155,8 +174,10 @@ internal static class ElevatedSetupTests
             Step("Compare post-undo settings with the exact initial baseline", delegate
             {
                 Dictionary<string, object> restored = PowerShell(SnapshotScript, Parameters());
-                Require(StableSettings(before) == StableSettings(restored), "Post-undo services, rule scope, network category, SMB/authentication policies or existing shares differ from the initial baseline.");
                 Report["RestoredBaseline"] = restored;
+                Report["PostUndoDifferences"] = SnapshotDifferences(before, restored);
+                SaveReport();
+                Require(StableSettings(before) == StableSettings(restored), "Post-undo services, rule scope, network category, SMB/authentication policies or existing shares differ from the initial baseline.");
                 return restored;
             });
             passed = true;
@@ -200,10 +221,12 @@ internal static class ElevatedSetupTests
                     Step("FINAL read-only verification of prepared state and preserved policies", delegate
                     {
                         Dictionary<string, object> final = PowerShell(SnapshotScript, Parameters());
+                        Report["FinalState"] = final;
+                        SaveReport();
                         VerifyPrepared(final);
                         var baseline = Report.ContainsKey("Baseline") ? (Dictionary<string, object>)Report["Baseline"] : null;
+                        if (baseline != null) { Report["FinalSnapshotDifferences"] = SnapshotDifferences(baseline, final); SaveReport(); }
                         if (baseline != null) Require(PreservedSettings(baseline) == PreservedSettings(final), "Preserved settings differ after final preparation.");
-                        Report["FinalState"] = final;
                         return final;
                     });
                 }
@@ -261,6 +284,38 @@ internal static class ElevatedSetupTests
         result["FixtureAclRestored"] = true;
         result["FixtureRetained"] = fixture;
         return result;
+    }
+
+    static string CommonFunctions()
+    {
+        string script = AdminConfigurator.BuildPrepareScript(selectedAdapter, false);
+        int boundary = script.IndexOf("\ntry {\n    switch ", StringComparison.Ordinal);
+        Require(boundary > 0, "Could not isolate the application's shared PowerShell functions.");
+        return script.Substring(0, boundary);
+    }
+
+    static object RepairDocumentedSharingFirewall()
+    {
+        Require(recoveryReport != null && recoveryReport.ContainsKey("Baseline") && Text(recoveryReport, "Computer") == Environment.MachineName && Text(recoveryReport, "Account") == WindowsIdentity.GetCurrent().Name, "Repair requires the matching completed third-run evidence.");
+        var priorSteps = ArrayValues(recoveryReport["Steps"]).Cast<Dictionary<string, object>>().ToArray();
+        foreach (string name in new[] { "CreateShareAsync read-only for current Windows account", "UndoAsync restores the preparation made by this harness", "FINAL PrepareAsync: leave the user's same Private connection prepared" })
+            Require(priorSteps.Any(s => Text(s, "Name") == name && Convert.ToBoolean(s["Success"])), "Required prior successful operation is missing: " + name);
+        Require(Convert.ToBoolean(recoveryReport["TestShareRemoved"]), "Prior test share cleanup was not confirmed.");
+        string auditPath = Path.Combine(ExeDirectory, "admin-runtime-readonly-audit.json");
+        Require(File.Exists(auditPath) && (File.GetAttributes(auditPath) & FileAttributes.ReparsePoint) == 0, "Documented repair audit is absent or unsafe.");
+        var audit = Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(auditPath));
+        var deltas = ArrayValues(audit["NonAppFirewallDeltas"]).Cast<Dictionary<string, object>>().ToArray();
+        var added = deltas.Where(d => Text(d, "Change") == "Added").Select(d => (Dictionary<string, object>)d["Rule"]).ToArray();
+        var changed = deltas.Where(d => Text(d, "Change") == "Changed").Select(d => (Dictionary<string, object>)d["Before"]).ToArray();
+        Require(added.Length == 11 && changed.Length == 11 && deltas.Length == 22 && added.Concat(changed).All(r => Text(r, "Group") == "@FirewallAPI.dll,-28672"), "Repair audit is not the exact documented eleven FPS additions and eleven template changes.");
+        var baseline = (Dictionary<string, object>)recoveryReport["Baseline"];
+        var parameters = Parameters();
+        parameters["OriginalFps"] = ArrayValues(baseline["OtherRules"]).Cast<Dictionary<string, object>>().Where(r => Text(r, "Group") == "@FirewallAPI.dll,-28672").ToArray();
+        parameters["ExpectedAdded"] = added.Select(r => Text(r, "Name")).ToArray();
+        parameters["ExpectedChanged"] = changed.Select(r => Text(r, "Name")).ToArray();
+        parameters["RepairEvidencePath"] = Path.Combine(ExeDirectory, "sharing-firewall-repair-" + Guid.NewGuid().ToString("N") + ".json");
+        parameters["SourceAudit"] = auditPath;
+        return PowerShell(CommonFunctions() + RepairSharingFirewallScript, parameters, 120000);
     }
 
     static void RecoverEmptyJournal(Dictionary<string, object> current)
@@ -425,14 +480,26 @@ internal static class ElevatedSetupTests
     static string StableSettings(Dictionary<string, object> snapshot)
     {
         var stable = new Dictionary<string, object>();
-        foreach (string key in new[] { "Category", "Services", "OwnRules", "OtherRules", "ExistingShares", "ServerSmb", "ClientSmb", "AuthenticationRegistry" }) stable[key] = snapshot[key];
+        foreach (string key in new[] { "Category", "Services", "OwnRules", "OtherRules", "ExistingShares", "ServerSmb", "ClientSmb", "AuthenticationRegistry" }) stable[key] = key == "OtherRules" ? NormalizeOtherRules(snapshot[key]) : snapshot[key];
         return Json.Serialize(stable);
     }
     static string PreservedSettings(Dictionary<string, object> snapshot)
     {
         var stable = new Dictionary<string, object>();
-        foreach (string key in new[] { "Category", "OtherRules", "ExistingShares", "ServerSmb", "ClientSmb", "AuthenticationRegistry" }) stable[key] = snapshot[key];
+        foreach (string key in new[] { "Category", "OtherRules", "ExistingShares", "ServerSmb", "ClientSmb", "AuthenticationRegistry" }) stable[key] = key == "OtherRules" ? NormalizeOtherRules(snapshot[key]) : snapshot[key];
         return Json.Serialize(stable);
+    }
+    static object NormalizeOtherRules(object raw)
+    {
+        var result = new List<Dictionary<string, object>>();
+        foreach (var rule in ArrayValues(raw).Cast<Dictionary<string, object>>())
+        {
+            var copy = new Dictionary<string, object>(rule);
+            if (Text(copy, "Group") == "@FirewallAPI.dll,-25000" && copy.ContainsKey("DisplayName") && Text(copy, "DisplayName").IndexOf("Teredo", StringComparison.OrdinalIgnoreCase) >= 0)
+                copy["Name"] = "Windows-Teredo-" + Text(copy, "Direction");
+            result.Add(copy);
+        }
+        return result.OrderBy(x => Text(x, "Name"), StringComparer.Ordinal).ToArray();
     }
     static object[] ArrayValues(object value) { return value == null ? new object[0] : ((IEnumerable)value).Cast<object>().ToArray(); }
     static string Text(Dictionary<string, object> item, string key) { return Convert.ToString(item[key], CultureInfo.InvariantCulture); }
@@ -446,7 +513,7 @@ internal static class ElevatedSetupTests
         if (File.Exists(ReportPath)) File.Replace(temporary, ReportPath, null); else File.Move(temporary, ReportPath);
     }
 
-    static Dictionary<string, object> PowerShell(string body, Dictionary<string, object> parameters)
+    static Dictionary<string, object> PowerShell(string body, Dictionary<string, object> parameters, int timeout = 45000)
     {
         string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(Json.Serialize(parameters)));
         string script = "$ErrorActionPreference='Stop'\r\n$q=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + encoded + "')) | ConvertFrom-Json\r\ntry { $data=& {\r\n" + body + "\r\n}; $envelope=@{Success=$true;Data=$data} } catch { $envelope=@{Success=$false;Error=$_.Exception.Message;Detail=$_.ToString();Position=$_.InvocationInfo.PositionMessage;Stack=$_.ScriptStackTrace} }; [Console]::Out.WriteLine('RC_ELEVATED:'+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($envelope|ConvertTo-Json -Depth 16 -Compress))))\r\n";
@@ -464,7 +531,7 @@ internal static class ElevatedSetupTests
                 process.OutputDataReceived += delegate(object s, DataReceivedEventArgs e) { if (e.Data != null) lock (output) output.AppendLine(e.Data); };
                 process.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e) { if (e.Data != null) lock (error) error.AppendLine(e.Data); };
                 process.Start(); process.BeginOutputReadLine(); process.BeginErrorReadLine();
-                if (!process.WaitForExit(45000)) { try { process.Kill(); } catch { } throw new TimeoutException("Windows PowerShell exceeded 45 seconds during elevated test step."); }
+                if (!process.WaitForExit(timeout)) { try { process.Kill(); } catch { } throw new TimeoutException("Windows PowerShell exceeded " + (timeout / 1000) + " seconds during elevated test step."); }
                 process.WaitForExit();
                 string text = output.ToString();
                 int marker = text.LastIndexOf("RC_ELEVATED:", StringComparison.Ordinal);
@@ -478,6 +545,32 @@ internal static class ElevatedSetupTests
         }
         finally { try { File.Delete(file); } catch { } }
     }
+
+    const string RepairSharingFirewallScript = @"
+
+$current=@(Get-FpsFirewallSnapshot)
+$defaults=@(Get-FpsFirewallSnapshot 'SystemDefaults')
+$desired=@()
+foreach($original in @($q.OriginalFps)) {
+    $matching=@($current|Where-Object{$_.Name -ceq [string]$original.Name})
+    if($matching.Count -ne 1){throw ('Original documented FPS rule is missing or ambiguous: '+$original.Name)}
+    $copy=$matching[0]|ConvertTo-Json -Depth 16|ConvertFrom-Json
+    foreach($key in @('Name','Group','Direction','Action')){if([string]$copy.$key -cne [string]$original.$key){throw ('Documented FPS structural identity changed: '+$original.Name+' / '+$key)}}
+    $copy.Profile=[string]$original.Profile
+    $copy.Enabled=[string]$original.Enabled
+    $desired+=$copy
+}
+$plan=Get-FpsRestorePlan $desired $current $defaults
+$removeNames=@($plan.Remove|ForEach-Object{$_.Name}|Sort-Object)
+$restoreNames=@($plan.Restore|ForEach-Object{$_.Before.Name}|Sort-Object)
+if(($removeNames|ConvertTo-Json -Compress) -cne (@($q.ExpectedAdded)|Sort-Object|ConvertTo-Json -Compress) -or ($restoreNames|ConvertTo-Json -Compress) -cne (@($q.ExpectedChanged)|Sort-Object|ConvertTo-Json -Compress)){throw 'The current safe restore plan differs from the exact documented eleven FPS changes; no rule was changed.'}
+$record=[pscustomobject]@{Computer=$env:COMPUTERNAME;Account=[Security.Principal.WindowsIdentity]::GetCurrent().Name;SourceAudit=[string]$q.SourceAudit;Scope='Only the documented New-SmbShare FPS Private splits and generated GUID copies from the prior test';Before=$current;Desired=$desired;SystemDefaults=$defaults;FpsPendingPlan=$null;Restoration=$null;Completed=$false}
+Write-JsonAtomic ([string]$q.RepairEvidencePath) $record
+$record.Restoration=Restore-FpsFirewallBaseline $desired $defaults $current $record ([string]$q.RepairEvidencePath)
+$record.Completed=$true
+Write-JsonAtomic ([string]$q.RepairEvidencePath) $record
+return [ordered]@{EvidencePath=[string]$q.RepairEvidencePath;RemovedPrivateCopies=$removeNames;RestoredTemplates=$restoreNames;Confirmed=$true;RuleCountBefore=$current.Count;RuleCountAfter=$desired.Count}
+";
 
     const string SnapshotScript = @"
 $adapter=Get-NetAdapter -InterfaceIndex ([int]$q.InterfaceIndex)
@@ -493,7 +586,7 @@ foreach ($rule in @($allRules|Where-Object{$_.Name.StartsWith($prefix,[StringCom
     if ($active.Count -ne 1) { throw ('Own rule is not effective in ActiveStore: '+$rule.Name) }
     $own+=[ordered]@{Name=[string]$rule.Name;Group=[string]$rule.Group;DisplayName=[string]$rule.DisplayName;Description=[string]$rule.Description;Enabled=[string]$rule.Enabled;Profile=[string]$rule.Profile;Direction=[string]$rule.Direction;Action=[string]$rule.Action;EdgeTraversalPolicy=[string]$rule.EdgeTraversalPolicy;Protocol=[string]$port.Protocol;LocalPort=(@($port.LocalPort)-join ',');RemotePort=(@($port.RemotePort)-join ',');LocalAddress=(@($address.LocalAddress)-join ',');RemoteAddress=(@($address.RemoteAddress)-join ',');Program=[string]$app.Program;Service=[string]$service.Service;InterfaceAlias=(@($interface.InterfaceAlias)-join ',')}
 }
-$others=@($allRules|Where-Object{!$_.Name.StartsWith($prefix,[StringComparison]::Ordinal)}|ForEach-Object{[ordered]@{Name=[string]$_.Name;Enabled=[string]$_.Enabled;Profile=[string]$_.Profile;Direction=[string]$_.Direction;Action=[string]$_.Action;Group=[string]$_.Group}})
+$others=@($allRules|Where-Object{!$_.Name.StartsWith($prefix,[StringComparison]::Ordinal)}|ForEach-Object{[ordered]@{Name=[string]$_.Name;Enabled=[string]$_.Enabled;Profile=[string]$_.Profile;Direction=[string]$_.Direction;Action=[string]$_.Action;Group=[string]$_.Group;DisplayName=[string]$_.DisplayName;Description=[string]$_.Description}})
 $services=@('fdPHost','FDResPub','LanmanServer','LanmanWorkstation'|ForEach-Object{$s=Get-Service -Name $_;$r=Get-ItemProperty -LiteralPath ('HKLM:\SYSTEM\CurrentControlSet\Services\'+$_);$has=$null -ne $r.PSObject.Properties['DelayedAutoStart'];$delay=0;if($has){$delay=[int]$r.DelayedAutoStart};[ordered]@{Name=$_;Start=[int]$r.Start;DelayedExists=$has;Delayed=$delay;Status=[string]$s.Status}})
 $shares=@(Get-SmbShare|Where-Object{!$q.ShareName -or $_.Name -cne [string]$q.ShareName}|Sort-Object Name|ForEach-Object{[ordered]@{Name=[string]$_.Name;Path=[string]$_.Path;Description=[string]$_.Description;Special=[bool]$_.Special}})
 $server=Get-SmbServerConfiguration

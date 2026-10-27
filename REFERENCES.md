@@ -16,6 +16,7 @@ Documentação primária:
 - [Regras de firewall](https://learn.microsoft.com/powershell/module/netsecurity/new-netfirewallrule)
 - [Perfis de conexão](https://learn.microsoft.com/powershell/module/netconnection/set-netconnectionprofile)
 - [Assinatura SMB](https://learn.microsoft.com/windows-server/storage/file-server/smb-signing)
+- [Configuração automática de firewall ao compartilhar no Windows](https://learn.microsoft.com/windows-server/storage/file-server/smb-secure-traffic)
 - [GitHub Releases API](https://docs.github.com/rest/releases/releases)
 
 A verificação SHA-256 do app detecta downloads corrompidos e usa o release oficial por HTTPS. Ela não substitui uma assinatura Authenticode do editor. As referências a Ed25519 no NetSparkle não significam que essa biblioteca ou sua assinatura foram incorporadas ao Rede Clara.

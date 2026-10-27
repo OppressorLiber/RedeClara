@@ -22,6 +22,7 @@ namespace RedeClara
             public string Script;
             public string Token;
             public string ReportPath;
+            public int Timeout;
         }
 
         public static bool IsAdministrator()
@@ -211,7 +212,7 @@ namespace RedeClara
             parameters["ShareName"] = name ?? "";
             parameters["Writable"] = writable;
             string data = Convert.ToBase64String(Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(parameters)));
-            return new Request { Token = token, ReportPath = report, Script = "$p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + data + "')) | ConvertFrom-Json\r\n" + CommonScript + OperationScript + FinalScript };
+            return new Request { Token = token, ReportPath = report, Timeout = operation == "share" ? 120000 : TimeoutMilliseconds, Script = "$p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + data + "')) | ConvertFrom-Json\r\n" + CommonScript + OperationScript + FinalScript };
         }
 
         static SetupResult Failure(string message) { return new SetupResult { Success = false, Message = message, Details = message, ReportPath = "" }; }
@@ -243,11 +244,11 @@ namespace RedeClara
                     process.Start();
                     process.BeginOutputReadLine();
                     process.BeginErrorReadLine();
-                    if (!process.WaitForExit(TimeoutMilliseconds))
+                    if (!process.WaitForExit(request.Timeout))
                     {
                         try { process.Kill(); } catch (InvalidOperationException) { }
                         process.WaitForExit(3000);
-                        return Failure("O Windows excedeu 45 segundos. A operação foi interrompida; execute o diagnóstico antes de tentar novamente. O registro de preparação preserva as alterações iniciadas em " + DataRoot + ".");
+                        return Failure("O Windows excedeu " + (request.Timeout / 1000).ToString(CultureInfo.InvariantCulture) + " segundos. A operação foi interrompida; execute o diagnóstico antes de tentar novamente. Os snapshots locais preservam as alterações iniciadas em " + DataRoot + ".");
                     }
                     process.WaitForExit();
                     string text;
@@ -358,14 +359,20 @@ function New-RuleSpecifications($selection) {
     )
 }
 function Rule-DisplayName($spec, $selection) { return ('Rede Clara · '+$spec.Name.Substring(('RedeClara-'+$selection.Id+'-').Length)+' · '+$selection.Adapter.Name) }
-function Get-RuleSnapshot($rule) {
-    $address = $rule | Get-NetFirewallAddressFilter
-    $port = $rule | Get-NetFirewallPortFilter
-    $application = $rule | Get-NetFirewallApplicationFilter
-    $service = $rule | Get-NetFirewallServiceFilter
-    $interface = $rule | Get-NetFirewallInterfaceFilter
-    $interfaceType = $rule | Get-NetFirewallInterfaceTypeFilter
-    $security = $rule | Get-NetFirewallSecurityFilter
+function Get-RuleSnapshot($rule, $cache=$null) {
+    if($null -ne $cache) {
+        $id=[string]$rule.Name
+        foreach($kind in @('Address','Port','Application','Service','Interface','InterfaceType','Security')){if(!$cache[$kind].ContainsKey($id)){throw ('Filtro de firewall ausente: '+$kind+' / '+$id)}}
+        $address=$cache.Address[$id];$port=$cache.Port[$id];$application=$cache.Application[$id];$service=$cache.Service[$id];$interface=$cache.Interface[$id];$interfaceType=$cache.InterfaceType[$id];$security=$cache.Security[$id]
+    } else {
+        $address = $rule | Get-NetFirewallAddressFilter
+        $port = $rule | Get-NetFirewallPortFilter
+        $application = $rule | Get-NetFirewallApplicationFilter
+        $service = $rule | Get-NetFirewallServiceFilter
+        $interface = $rule | Get-NetFirewallInterfaceFilter
+        $interfaceType = $rule | Get-NetFirewallInterfaceTypeFilter
+        $security = $rule | Get-NetFirewallSecurityFilter
+    }
     return [pscustomobject]@{
         Name=[string]$rule.Name; DisplayName=[string]$rule.DisplayName; Description=[string]$rule.Description; Group=[string]$rule.Group;
         Enabled=[string]$rule.Enabled; Profile=[string]$rule.Profile; Direction=[string]$rule.Direction;
@@ -375,8 +382,120 @@ function Get-RuleSnapshot($rule) {
         Program=[string]$application.Program; Package=[string]$application.Package; Service=[string]$service.Service;
         InterfaceAlias=@($interface.InterfaceAlias); InterfaceType=[string]$interfaceType.InterfaceType;
         Authentication=[string]$security.Authentication; Encryption=[string]$security.Encryption;
-        LocalUser=[string]$security.LocalUser; RemoteUser=[string]$security.RemoteUser; RemoteMachine=[string]$security.RemoteMachine
+        LocalUser=[string]$security.LocalUser; RemoteUser=[string]$security.RemoteUser; RemoteMachine=[string]$security.RemoteMachine;
+        IcmpType=@($port.IcmpType); DynamicTarget=[string]$port.DynamicTarget; DynamicTransport=[string]$port.DynamicTransport;
+        ElementName=[string]$rule.ElementName; Owner=[string]$rule.Owner; Platform=@($rule.Platform);
+        LooseSourceMapping=[bool]$rule.LooseSourceMapping; LocalOnlyMapping=[bool]$rule.LocalOnlyMapping;
+        PolicyAppId=[string]$rule.PolicyAppId; PackageFamilyName=[string]$rule.PackageFamilyName;
+        RemoteDynamicKeywordAddresses=@($rule.RemoteDynamicKeywordAddresses);
+        OverrideBlockRules=[string]$security.OverrideBlockRules; LocalUsers=[string]$security.LocalUsers;
+        RemoteUsers=[string]$security.RemoteUsers; RemoteMachines=[string]$security.RemoteMachines;
+        PolicyStoreSource=[string]$rule.PolicyStoreSource; PolicyStoreSourceType=[string]$rule.PolicyStoreSourceType
     }
+}
+function Get-FpsFirewallSnapshot([string]$store='PersistentStore') {
+    $rules=@(Get-NetFirewallRule -PolicyStore $store -Group '@FirewallAPI.dll,-28672' -ErrorAction Stop | Sort-Object Name)
+    if(!$rules.Count){throw 'Os modelos de firewall FPS do Windows não estão disponíveis; compartilhamento bloqueado antes de alterações.'}
+    $cache=@{}
+    foreach($kind in @('Address','Port','Application','Service','Interface','InterfaceType','Security')) {
+        $command='Get-NetFirewall'+$kind+'Filter'
+        $map=@{}
+        foreach($filter in @(& $command -All -PolicyStore $store -ErrorAction Stop)) {
+            $id=[string]$filter.InstanceID
+            if($map.ContainsKey($id)){throw ('Filtro de firewall duplicado: '+$kind+' / '+$id)}
+            $map[$id]=$filter
+        }
+        $cache[$kind]=$map
+    }
+    return @($rules | ForEach-Object { Get-RuleSnapshot $_ $cache })
+}
+function Fps-Fingerprint($rule, [bool]$structureOnly=$false, [bool]$ignoreStore=$false) {
+    $values=[ordered]@{}
+    foreach($property in @($rule.PSObject.Properties | Sort-Object Name)) {
+        if($structureOnly -and $property.Name -in @('Name','Profile','Enabled')){continue}
+        if($ignoreStore -and $property.Name -in @('PolicyStoreSource','PolicyStoreSourceType')){continue}
+        $value=$property.Value
+        if($property.Name -eq 'Program'){$value=[Environment]::ExpandEnvironmentVariables([string]$value).ToLowerInvariant()}
+        elseif($value -is [Array]){$value=@($value | ForEach-Object{[string]$_} | Sort-Object)}
+        $values[$property.Name]=$value
+    }
+    return ($values|ConvertTo-Json -Depth 8 -Compress)
+}
+function Fps-ProfileMask([string]$value) {
+    if($value -eq 'Any'){return 7}
+    $mask=0
+    foreach($part in @($value -split ',')) {
+        switch($part.Trim()){'Domain'{$mask=$mask -bor 1};'Private'{$mask=$mask -bor 2};'Public'{$mask=$mask -bor 4};default{throw ('Perfil de regra inválido: '+$value)}}
+    }
+    return $mask
+}
+function Get-FpsRestorePlan($before, $after, $systemDefaults) {
+    $old=@{};$now=@{};$defaults=@{};$changed=@();$remove=@();$consumed=@{}
+    foreach($rule in @($systemDefaults)){if($rule.Name -like 'FPS-*' -and $rule.Group -ceq '@FirewallAPI.dll,-28672'){$defaults[[string]$rule.Name]=$rule}}
+    foreach($rule in @($before)){if($rule.Group -cne '@FirewallAPI.dll,-28672' -or $old.ContainsKey([string]$rule.Name)){throw 'Snapshot FPS inválido ou duplicado.'};$old[[string]$rule.Name]=$rule}
+    foreach($rule in @($after)){if($rule.Group -cne '@FirewallAPI.dll,-28672' -or $now.ContainsKey([string]$rule.Name)){throw 'Estado FPS inválido ou duplicado.'};$now[[string]$rule.Name]=$rule}
+    foreach($name in @($old.Keys)) {
+        if(!$now.ContainsKey($name)){throw ('Uma regra FPS anterior desapareceu; preservação automática bloqueada: '+$name)}
+        $a=$old[$name];$b=$now[$name]
+        if((Fps-Fingerprint $a) -ceq (Fps-Fingerprint $b)){continue}
+        if(!$defaults.ContainsKey($name) -or (Fps-Fingerprint $a $true $true) -cne (Fps-Fingerprint $defaults[$name] $true $true) -or
+            $a.PolicyStoreSourceType -ne 'Local' -or $b.PolicyStoreSourceType -ne 'Local' -or $a.PolicyStoreSource -ne 'PersistentStore' -or $b.PolicyStoreSource -ne 'PersistentStore' -or
+            (Fps-Fingerprint $a $true) -cne (Fps-Fingerprint $b $true)) {throw ('Uma regra FPS foi alterada além do perfil/ativação; ela foi preservada: '+$name)}
+        $oldMask=Fps-ProfileMask $a.Profile;$newMask=Fps-ProfileMask $b.Profile
+        if(($oldMask -band 2) -eq 0 -or ($newMask -ne $oldMask -and $newMask -ne ($oldMask -band 5)) -or
+            ($b.Enabled -ne $a.Enabled -and $b.Enabled -ne 'True')){throw ('Delta FPS não corresponde à ativação privada feita pelo Windows: '+$name)}
+        $changed+= [pscustomobject]@{Before=$a;After=$b}
+    }
+    foreach($name in @($now.Keys | Sort-Object)) {
+        if($old.ContainsKey($name)){continue}
+        $rule=$now[$name]
+        if($name -notmatch '^\{[0-9a-fA-F-]{36}\}$' -or $rule.Profile -ne 'Private' -or $rule.Enabled -ne 'True' -or $rule.PolicyStoreSourceType -ne 'Local' -or $rule.PolicyStoreSource -ne 'PersistentStore'){throw ('Regra FPS nova não identificada como cópia privada do Windows; preservada: '+$name)}
+        $matches=@($changed | Where-Object { $original=$_.Before;$retained=$_.After;
+            (Fps-ProfileMask $retained.Profile) -eq ((Fps-ProfileMask $original.Profile) -band 5) -and
+            (Fps-Fingerprint $original $true) -ceq (Fps-Fingerprint $rule $true)
+        })
+        if($matches.Count -ne 1 -or $consumed.ContainsKey([string]$matches[0].Before.Name)){throw ('Não há um único modelo FPS original para restaurar a cópia privada: '+$name)}
+        $consumed[[string]$matches[0].Before.Name]=$true
+        $remove+=$rule
+    }
+    foreach($item in $changed) {
+        if((Fps-ProfileMask $item.Before.Profile) -ne (Fps-ProfileMask $item.After.Profile) -and !$consumed.ContainsKey([string]$item.Before.Name)){throw ('Divisão FPS sem cópia privada correspondente; preservada: '+$item.Before.Name)}
+    }
+    return [pscustomobject]@{Remove=@($remove);Restore=@($changed)}
+}
+function Assert-FpsBaselineSupported($baseline,$systemDefaults) {
+    foreach($rule in @($baseline)) {
+        if(((Fps-ProfileMask $rule.Profile) -band 2) -eq 0 -or $rule.Enabled -eq 'True'){continue}
+        $matches=@($systemDefaults|Where-Object{$_.Name -ceq $rule.Name -and (Fps-Fingerprint $_ $true $true) -ceq (Fps-Fingerprint $rule $true $true)})
+        if($matches.Count -ne 1 -or $rule.Name -notlike 'FPS-*' -or $rule.PolicyStoreSourceType -ne 'Local'){throw ('Regra FPS privada personalizada não pode ser alterada com segurança; nenhuma pasta foi compartilhada: '+$rule.Name)}
+    }
+}
+function Restore-FpsFirewallBaseline($baseline, $systemDefaults, $observed=$null, $checkpoint=$null, [string]$checkpointPath='') {
+    $after=@($observed)
+    if($null -eq $observed){$after=@(Get-FpsFirewallSnapshot)}
+    $plan=$null
+    if($null -ne $checkpoint -and $null -ne $checkpoint.FpsPendingPlan){$plan=$checkpoint.FpsPendingPlan}
+    if($null -eq $plan) {
+        $plan=Get-FpsRestorePlan @($baseline) $after @($systemDefaults)
+        if($null -ne $checkpoint){$checkpoint.FpsPendingPlan=$plan;Write-JsonAtomic $checkpointPath $checkpoint}
+    }
+    # Validate the complete delta before touching any rule; recheck each exact current value.
+    foreach($expected in @($plan.Remove)) {
+        $current=@(Get-NetFirewallRule -PolicyStore PersistentStore -Name $expected.Name -ErrorAction SilentlyContinue)
+        if(!$current.Count){continue} # Only a previously validated, checkpointed copy can be absent on retry.
+        if($current.Count -ne 1 -or (Fps-Fingerprint (Get-RuleSnapshot $current[0])) -cne (Fps-Fingerprint $expected)){throw ('Regra FPS mudou durante a restauração; preservada: '+$expected.Name)}
+        $current[0]|Remove-NetFirewallRule
+    }
+    foreach($item in @($plan.Restore)) {
+        $current=@(Get-NetFirewallRule -PolicyStore PersistentStore -Name $item.After.Name -ErrorAction SilentlyContinue)
+        if($current.Count -eq 1 -and (Fps-Fingerprint (Get-RuleSnapshot $current[0])) -ceq (Fps-Fingerprint $item.Before)){continue}
+        if($current.Count -ne 1 -or (Fps-Fingerprint (Get-RuleSnapshot $current[0])) -cne (Fps-Fingerprint $item.After)){throw ('Modelo FPS mudou durante a restauração; preservado: '+$item.After.Name)}
+        $current[0]|Set-NetFirewallRule -Profile ([string]$item.Before.Profile) -Enabled ([string]$item.Before.Enabled) | Out-Null
+    }
+    $verified=@(Get-FpsFirewallSnapshot)
+    if(($verified|ForEach-Object{Fps-Fingerprint $_}|Sort-Object|ConvertTo-Json -Compress) -cne (@($baseline)|ForEach-Object{Fps-Fingerprint $_}|Sort-Object|ConvertTo-Json -Compress)){throw 'O firewall FPS anterior não foi confirmado integralmente; o compartilhamento não será considerado concluído.'}
+    if($null -ne $checkpoint){$checkpoint.FpsPendingPlan=$null;Write-JsonAtomic $checkpointPath $checkpoint}
+    return [pscustomobject]@{Before=@($baseline);AfterOperation=$after;Restored=$verified;RemovedPrivateCopies=@($plan.Remove|ForEach-Object{$_.Name});RestoredTemplates=@($plan.Restore|ForEach-Object{$_.Before.Name});Confirmed=$true}
 }
 function Single-Equals($value, [string]$expected) { return (@($value).Count -eq 1 -and [string]@($value)[0] -ieq $expected) }
 function Rule-Matches($rule, $spec, $selection) {
@@ -642,12 +761,15 @@ function Share {
     }
     if (($deny -band [long]$rights) -ne 0) { throw 'Há uma negação NTFS aplicável à conta selecionada. Ela foi preservada; selecione outra pasta ou revise suas permissões.' }
     $needsAcl=(($allow -band [long]$rights) -ne [long]$rights -or ($inheritable -band [long]$rights) -ne [long]$rights)
+    $fpsBefore=@(Get-FpsFirewallSnapshot)
+    $fpsTemplates=@(Get-FpsFirewallSnapshot 'SystemDefaults')
+    Assert-FpsBaselineSupported $fpsBefore $fpsTemplates
     $snapshotPath=Join-Path $p.Root ('Shares\'+$p.Token+'.json')
-    $snapshot=[pscustomobject]@{ Computer=$env:COMPUTERNAME; Account=$account; Sid=$sid.Value; Path=$folder; ShareName=$name; ShareRight=$shareRight; OriginalSddl=$originalSddl; AppliedSddl=''; AclChanged=$false; Created=$false; Token=$p.Token }
+    $snapshot=[pscustomobject]@{ Computer=$env:COMPUTERNAME; Account=$account; Sid=$sid.Value; Path=$folder; ShareName=$name; ShareRight=$shareRight; OriginalSddl=$originalSddl; AppliedSddl=''; AclChanged=$false; Created=$false; Token=$p.Token; FpsBefore=$fpsBefore; FpsSystemDefaults=$fpsTemplates; FpsAfterCreate=@(); FpsAfterRollback=@(); FpsPendingPlan=$null; FpsRestoration=$null; FpsFinalVerification=$null; FpsRestored=$false; FpsRestorationError='' }
     Write-JsonAtomic $snapshotPath $snapshot
     $aclChanged=$false; $created=$false; $creationAttempted=$false; $appliedSddl=''
     $description='Criado pelo Rede Clara '+$p.Token
-    try {
+    try { try {
         if ($needsAcl) {
             $grant=New-Object Security.AccessControl.FileSystemAccessRule($sid,$rights,([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit),[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow)
             $acl.AddAccessRule($grant) | Out-Null
@@ -669,6 +791,11 @@ function Share {
         $created=$true
         $snapshot.Created=$true
         Write-JsonAtomic $snapshotPath $snapshot
+        $snapshot.FpsAfterCreate=@(Get-FpsFirewallSnapshot)
+        Write-JsonAtomic $snapshotPath $snapshot
+        $snapshot.FpsRestoration=Restore-FpsFirewallBaseline $fpsBefore $fpsTemplates $snapshot.FpsAfterCreate $snapshot $snapshotPath
+        $snapshot.FpsRestored=$true
+        Write-JsonAtomic $snapshotPath $snapshot
         $share=Get-SmbShare -Name $name
         $access=@(Get-SmbShareAccess -Name $name)
         if ($share.Path.TrimEnd('\') -ine $folder -or $share.Description -cne $description -or $access.Count -ne 1 -or $access[0].AccessControlType -ne 'Allow' -or [string]$access[0].AccessRight -ne $shareRight) { throw 'O Windows não confirmou a pasta e as permissões exclusivas do compartilhamento.' }
@@ -683,9 +810,25 @@ function Share {
         Say ('Acesso de rede: \\'+$env:COMPUTERNAME+'\'+$name)
         Say ('Única conta autorizada no compartilhamento: '+$account+'; permissão: '+$shareRight+'. A senha dessa conta continua obrigatória conforme a política atual do Windows.')
         Say ('Snapshot das permissões anteriores: '+$snapshotPath)
+        Say 'Regras internas de Compartilhamento de Arquivos e Impressoras conferidas e preservadas após a ativação automática do Windows; somente as regras próprias de escopo local permanecem adicionais.'
         Say 'Permissões próprias de arquivos e subpastas podem limitar o acesso a itens individuais. A restauração de rede não apaga este compartilhamento.'
         $script:success=$true
         $script:message='Pasta compartilhada e acesso da sua conta verificado.'
+    } finally {
+        if($creationAttempted) {
+            try {
+                Start-Sleep -Milliseconds 300
+                $snapshot.FpsFinalVerification=Restore-FpsFirewallBaseline $fpsBefore $fpsTemplates $null $snapshot $snapshotPath
+                $snapshot.FpsRestored=$true
+                Write-JsonAtomic $snapshotPath $snapshot
+            } catch {
+                $snapshot.FpsRestored=$false
+                $snapshot.FpsRestorationError=$_.Exception.Message
+                try{Write-JsonAtomic $snapshotPath $snapshot}catch{}
+                throw ('Não foi possível preservar o firewall anterior ao compartilhar: '+$snapshot.FpsRestorationError)
+            }
+        }
+    }
     } catch {
         $failure=$_.Exception.Message
         if ($creationAttempted) {
@@ -698,6 +841,19 @@ function Share {
                 }
                 elseif ($current) { Say 'O compartilhamento mudou durante a operação e foi preservado.' }
             } catch { Say ('Não foi possível reverter o novo compartilhamento: '+$_.Exception.Message) }
+            try {
+                $snapshot.FpsAfterRollback=@(Get-FpsFirewallSnapshot)
+                $snapshot.FpsFinalVerification=Restore-FpsFirewallBaseline $fpsBefore $fpsTemplates $snapshot.FpsAfterRollback $snapshot $snapshotPath
+                $snapshot.FpsRestored=$true
+                Write-JsonAtomic $snapshotPath $snapshot
+                Say 'Firewall FPS anterior confirmado após reverter a criação da pasta.'
+            } catch {
+                $snapshot.FpsRestored=$false
+                $snapshot.FpsRestorationError=$_.Exception.Message
+                try{Write-JsonAtomic $snapshotPath $snapshot}catch{}
+                Say ('Restauração do firewall não confirmada; regras não identificadas foram preservadas. Snapshot: '+$snapshotPath+'; '+$snapshot.FpsRestorationError)
+                $failure+=' A restauração do firewall também não foi confirmada; consulte o snapshot '+$snapshotPath+'.'
+            }
         }
         if ($aclChanged) {
             try {

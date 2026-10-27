@@ -73,6 +73,7 @@ internal static class AdminTests
             }
             TestProfileGates(scripts["prepare-private"], directory);
             VerifyAtomicWriter(scripts["prepare-private"], directory);
+            VerifyFpsRestoration(scripts["prepare-private"], directory);
 
             if (args.Length > 0 && args[0] == "--diagnose")
             {
@@ -142,6 +143,68 @@ if(([IO.File]::ReadAllText($target)|ConvertFrom-Json).Step -ne 3){throw 'Third a
             string output = process.StandardOutput.ReadToEnd();
             process.WaitForExit();
             Check(process.ExitCode == 0 && output.Contains("REAL_ATOMIC_WRITER_PASS"), "Real Windows PowerShell atomic writer failed: " + errors);
+        }
+    }
+
+    static void VerifyFpsRestoration(string script, string directory)
+    {
+        int boundary = script.IndexOf("\ntry {\n    switch ", StringComparison.Ordinal);
+        Check(boundary > 0, "Could not isolate FPS guard functions");
+        string test = script.Substring(0, boundary) + @"
+function Clone($value){return ($value|ConvertTo-Json -Depth 16|ConvertFrom-Json)}
+function Check([bool]$value,[string]$message){if(!$value){throw $message};$script:fpsChecks++}
+function Rejected($action,[string]$message){$bad=$false;try{& $action|Out-Null}catch{$bad=$true};Check $bad $message}
+$script:fpsChecks=0
+$old=[pscustomobject]@{Name='FPS-Unit-In-TCP-V2';Group='@FirewallAPI.dll,-28672';DisplayName='Windows FPS unit';Description='TCP 445';Enabled='False';Profile='Domain, Private';Direction='Inbound';Action='Allow';Protocol='TCP';LocalPort=@('445');RemotePort=@('Any');LocalAddress=@('Any');RemoteAddress=@('LocalSubnet');Program='System';Service='Any';IcmpType=@('Any');Authentication='NotRequired';Encryption='NotRequired';PolicyStoreSource='PersistentStore';PolicyStoreSourceType='Local'}
+$default=Clone $old;$default.Profile='Any';$default.PolicyStoreSource='SystemDefaults';$default.PolicyStoreSourceType='Hardcoded'
+$split=Clone $old;$split.Profile='Domain'
+$copy=Clone $old;$copy.Name='{11111111-1111-1111-1111-111111111111}';$copy.Profile='Private';$copy.Enabled='True'
+Assert-FpsBaselineSupported @($old) @($default)
+$plan=Get-FpsRestorePlan @($old) @($split,$copy) @($default)
+Check (@($plan.Remove).Count -eq 1 -and @($plan.Restore).Count -eq 1) 'Windows Private split did not produce one narrow restore/remove pair'
+$same=Get-FpsRestorePlan @($old) @($old) @($default)
+Check (!@($same.Remove).Count -and !@($same.Restore).Count) 'Unchanged baseline produced mutations'
+foreach($field in @('LocalPort','RemoteAddress','Program','Service','IcmpType','Authentication')){
+    $script:badCopy=Clone $copy;$script:badCopy.$field='changed'
+    Rejected {Get-FpsRestorePlan @($old) @($split,$script:badCopy) @($default)} ('Altered '+$field+' fingerprint was accepted')
+}
+$duplicate=Clone $copy;$duplicate.Name='{22222222-2222-2222-2222-222222222222}'
+Rejected {Get-FpsRestorePlan @($old) @($split,$copy,$duplicate) @($default)} 'Two generated copies consumed one original template'
+$unknown=Clone $copy;$unknown.Name='ThirdParty-Rule'
+Rejected {Get-FpsRestorePlan @($old) @($split,$unknown) @($default)} 'Non-GUID third-party rule accepted for deletion'
+Rejected {Get-FpsRestorePlan @($old) @($copy) @($default)} 'Missing original template was accepted'
+$custom=Clone $old;$custom.LocalPort=@('444')
+Rejected {Assert-FpsBaselineSupported @($custom) @($default)} 'Unsupported customized Private template passed preflight'
+$wrongProfile=Clone $copy;$wrongProfile.Profile='Public'
+Rejected {Get-FpsRestorePlan @($old) @($split,$wrongProfile) @($default)} 'New Public rule accepted for removal'
+$badOriginal=Clone $split;$badOriginal.Program='custom.exe'
+Rejected {Get-FpsRestorePlan @($old) @($badOriginal,$copy) @($default)} 'Modified original program was accepted'
+$script:mockRows=@((Clone $split),(Clone $copy));$script:checkpointSaved=$false;$script:failSet=$true;$script:removals=0;$script:sets=0
+function Get-FpsFirewallSnapshot([string]$store='PersistentStore'){return @($script:mockRows|ForEach-Object{Clone $_})}
+function Get-RuleSnapshot($rule,$cache=$null){return Clone $rule}
+function Get-NetFirewallRule { [CmdletBinding()]param([string]$PolicyStore,[string]$Name);return @($script:mockRows|Where-Object{$_.Name -ceq $Name}) }
+function Write-JsonAtomic($path,$value){$script:checkpointSaved=$null -ne $value.FpsPendingPlan}
+function Remove-NetFirewallRule {param([Parameter(ValueFromPipeline=$true)]$InputObject);process{if(!$script:checkpointSaved){throw 'Removal happened before durable plan checkpoint'};$script:removals++;$script:mockRows=@($script:mockRows|Where-Object{$_.Name -cne $InputObject.Name})}}
+function Set-NetFirewallRule {param([Parameter(ValueFromPipeline=$true)]$InputObject,[string]$Profile,[string]$Enabled);process{if($script:failSet){$script:failSet=$false;throw 'FORCED_SET_FAILURE'};$script:sets++;$InputObject.Profile=$Profile;$InputObject.Enabled=$Enabled}}
+$checkpoint=[pscustomobject]@{FpsPendingPlan=$null}
+Rejected {Restore-FpsFirewallBaseline @($old) @($default) $null $checkpoint 'inert'} 'Forced Set failure was hidden'
+Check ($script:removals -eq 1 -and $null -ne $checkpoint.FpsPendingPlan) 'Incomplete restore did not retain its exact pending plan'
+$resumed=Restore-FpsFirewallBaseline @($old) @($default) $null $checkpoint 'inert'
+Check ($resumed.Confirmed -and $script:removals -eq 1 -and $script:sets -eq 1 -and $null -eq $checkpoint.FpsPendingPlan) 'Saved plan could not safely resume after one removed copy'
+Check ((Fps-Fingerprint $script:mockRows[0]) -ceq (Fps-Fingerprint $old)) 'Retry did not restore the exact original snapshot'
+[Console]::Out.WriteLine('FPS_GUARD_CASES_PASS='+$script:fpsChecks)
+";
+        string file = Path.Combine(directory, "fps-restoration-tests.ps1");
+        File.WriteAllText(file, test, new UTF8Encoding(true));
+        string command = "& '" + file.Replace("'", "''") + "'";
+        string exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+        var start = new ProcessStartInfo(exe, "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(command)));
+        start.UseShellExecute = false; start.CreateNoWindow = true; start.RedirectStandardOutput = true; start.RedirectStandardError = true;
+        using (Process process = Process.Start(start))
+        {
+            string errors = process.StandardError.ReadToEnd(); string output = process.StandardOutput.ReadToEnd(); process.WaitForExit();
+            Check(process.ExitCode == 0 && output.Contains("FPS_GUARD_CASES_PASS="), "FPS restore guard regression failed: " + errors);
+            Console.WriteLine(output.Trim());
         }
     }
 
