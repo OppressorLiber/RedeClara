@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Rede Clara</title>
+  <desc id="desc">Rede local branca sobre um quadrado azul de cantos arredondados.</desc>
+  <rect width="256" height="256" rx="64" fill="#0069DE"/>
+  <g transform="translate(44 47.5) scale(7)" fill="none" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 1V8 M8 8H16V12H8Z M12 12V16 M2 22V16H22V22 M12 16V22"/>
+  </g>
+</svg>
