@@ -29,7 +29,7 @@ internal static class LayoutTests
             }
             TestSize(xaml, 1030, 720);
             TestSize(xaml, 1180, 800);
-            if (args.Length >= 2 && args[1] != "--baseline-padding") TestControllerOverlay(args[1]);
+            if (args.Length >= 2 && args[1] != "--baseline-padding") { TestControllerOverlay(args[1]); TestShareAudienceController(args[1]); }
         }
         catch (Exception ex) { failures++; Console.Error.WriteLine("ERROR " + ex); }
         Console.WriteLine("RESULT: " + (checks - failures) + "/" + checks + " checks passed; failures=" + failures);
@@ -102,6 +102,77 @@ internal static class LayoutTests
             Point buttonTop = connect.TranslatePoint(new Point(), scroll);
             Check(buttonTop.Y >= -0.5 && buttonTop.Y + connect.ActualHeight <= scroll.ActualHeight + 0.5,
                 size + " full recovery button reachable at scroll bottom; y=" + buttonTop.Y.ToString("0.0") + " height=" + connect.ActualHeight.ToString("0.0"));
+
+            Get<Grid>(window, "DevicePage").Visibility = Visibility.Collapsed;
+            Get<Grid>(window, "CreateSharePage").Visibility = Visibility.Visible;
+            Check(Get<RadioButton>(window, "ShareCurrentRadio").IsChecked == true && Get<RadioButton>(window, "ReadOnlyRadio").IsChecked == true,
+                size + " sharing defaults to the current account and read-only");
+            Get<Border>(window, "CurrentAccountPanel").Visibility = Visibility.Collapsed;
+            Get<StackPanel>(window, "SpecificAccountPanel").Visibility = Visibility.Visible;
+            Layout(window, width, height);
+            var shareScroll = Get<ScrollViewer>(window, "CreateShareScroll");
+            shareScroll.ScrollToBottom(); Layout(window, width, height);
+            var createButton = Get<Button>(window, "CreateShareButton");
+            Point createTop = createButton.TranslatePoint(new Point(), shareScroll);
+            Check(createTop.Y >= -0.5 && createTop.Y + createButton.ActualHeight <= shareScroll.ActualHeight + 0.5,
+                size + " sharing action stays reachable after choosing a specific account");
+            Check(Get<TextBox>(window, "ShareAccountName").ActualHeight >= 36 && Get<TextBox>(window, "ShareAccountName").ActualHeight <= 44,
+                size + " specific-account input uses the compact input scale");
+        }
+        finally { window.Close(); }
+    }
+
+    static void TestShareAudienceController(string assemblyPath)
+    {
+        Assembly assembly = Assembly.LoadFrom(Path.GetFullPath(assemblyPath));
+        Type controllerType = assembly.GetType("RedeClara.MainController", true);
+        object controller = Activator.CreateInstance(controllerType, true);
+        var window = (Window)controllerType.GetProperty("Window").GetValue(controller, null);
+        try
+        {
+            Get<CheckBox>(window, "ReducedMotion").IsChecked = true;
+            var current = Get<RadioButton>(window, "ShareCurrentRadio");
+            var specific = Get<RadioButton>(window, "ShareSpecificRadio");
+            var everyone = Get<RadioButton>(window, "ShareEveryoneRadio");
+            var account = Get<TextBox>(window, "ShareAccountName");
+            Check(current.IsChecked == true && Get<Border>(window, "CurrentAccountPanel").Visibility == Visibility.Visible &&
+                Get<StackPanel>(window, "SpecificAccountPanel").Visibility == Visibility.Collapsed && Get<Border>(window, "EveryoneAccessNotice").Visibility == Visibility.Collapsed,
+                "current account is the only initial sharing audience and only its guidance is visible");
+            specific.IsChecked = true;
+            Check(current.IsChecked != true && everyone.IsChecked != true && Get<StackPanel>(window, "SpecificAccountPanel").Visibility == Visibility.Visible &&
+                Get<Border>(window, "CurrentAccountPanel").Visibility == Visibility.Collapsed,
+                "specific-user radio reveals its account field and hides the current-account guidance");
+            Check(account.MaxLength == 256 && !string.IsNullOrWhiteSpace(System.Windows.Automation.AutomationProperties.GetName(account)),
+                "specific username is bounded and has an accessible name");
+            var create = (System.Threading.Tasks.Task)controllerType.GetMethod("CreateShare", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(controller, null);
+            create.GetAwaiter().GetResult();
+            Check(Get<TextBlock>(window, "CreateShareMessage").Text.IndexOf("usuário", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                !(bool)controllerType.GetField("preparing", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(controller),
+                "empty specific username is rejected before any administrative sharing operation");
+            account.Text = @"PC-EXEMPLO\pessoa";
+            everyone.IsChecked = true;
+            Check(specific.IsChecked != true && Get<Border>(window, "EveryoneAccessNotice").Visibility == Visibility.Visible &&
+                Get<StackPanel>(window, "SpecificAccountPanel").Visibility == Visibility.Collapsed,
+                "Everyone is an explicit choice with contextual authentication guidance");
+            var notice = Get<TextBlock>(window, "EveryoneAccessText");
+            Check(notice.Text.IndexOf("senha", StringComparison.OrdinalIgnoreCase) >= 0 && notice.Text.IndexOf("pasta", StringComparison.OrdinalIgnoreCase) >= 0,
+                "Everyone guidance explains its folder scope and preserves password expectations");
+            controllerType.GetMethod("BusySetup", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(controller, new object[] { true });
+            Check(!current.IsEnabled && !specific.IsEnabled && !everyone.IsEnabled && !account.IsEnabled &&
+                !Get<Button>(window, "BrowseFolder").IsEnabled && !Get<TextBox>(window, "ShareName").IsEnabled &&
+                !Get<RadioButton>(window, "ReadOnlyRadio").IsEnabled && !Get<RadioButton>(window, "WritableRadio").IsEnabled,
+                "in-flight setup disables every sharing choice and editable input");
+            controllerType.GetMethod("BusySetup", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(controller, new object[] { false });
+            specific.IsChecked = true;
+            Check(account.Text == @"PC-EXEMPLO\pessoa" && account.IsEnabled && Get<Button>(window, "BrowseFolder").IsEnabled,
+                "switching back preserves the typed account and setup unlocks the form");
+            Check(Get<StackPanel>(window, "SpecificAccountPanel").Opacity == 1 && Get<StackPanel>(window, "SpecificAccountPanel").RenderTransform.Value.IsIdentity,
+                "reduced motion reveals audience guidance immediately without a transform");
+            Get<CheckBox>(window, "ReducedMotion").IsChecked = false;
+            controllerType.GetMethod("Reveal", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(controller, new object[] { Get<StackPanel>(window, "SpecificAccountPanel"), 0 });
+            everyone.IsChecked = true; specific.IsChecked = true;
+            Check(Get<StackPanel>(window, "SpecificAccountPanel").Opacity == 1 && Get<StackPanel>(window, "SpecificAccountPanel").RenderTransform.Value.IsIdentity,
+                "keyboard audience switching cancels an interrupted reveal and shows guidance immediately");
         }
         finally { window.Close(); }
     }

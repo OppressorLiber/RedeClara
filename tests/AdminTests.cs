@@ -37,6 +37,15 @@ internal static class AdminTests
             Check(!AdminConfigurator.UndoAsync(null).Result.Success, "Null undo adapter accepted");
             Check(!AdminConfigurator.DiagnoseAsync(null).Result.Success, "Null diagnostic adapter accepted");
             Check(!AdminConfigurator.CreateShareAsync(directory, "a$", false).Result.Success, "Invalid share reached PowerShell");
+            Check(AdminConfigurator.ValidateShareAudience("current", "") == null, "Current account mode rejected");
+            Check(AdminConfigurator.ValidateShareAudience("everyone", "") == null, "Everyone mode rejected");
+            foreach (string account in new string[] { "milena", @"MILENA\milena", @".\milena", @"MicrosoftAccount\milena@example.test", @"DOMINIO\pessoa" })
+                Check(AdminConfigurator.ValidateShareAudience("specific", account) == null, "Valid principal syntax rejected: " + account);
+            foreach (string audience in new string[] { null, "", "Everyone", "all", "current\n" })
+                Check(AdminConfigurator.ValidateShareAudience(audience, "") != null, "Unknown audience accepted");
+            foreach (string account in new string[] { null, "", " ", "a\rb", "a\nb", "a\0b", " a", "a ", "a/b", @"a\b\c", "\\a", "a\\", new string('a', 257) })
+                Check(AdminConfigurator.ValidateShareAudience("specific", account) != null, "Invalid principal syntax accepted");
+            Check(!AdminConfigurator.CreateShareAsync(directory, "Arquivos", false, "specific", "").Result.Success, "Empty principal reached PowerShell");
 
             var adapter = new AdapterInfo { InterfaceIndex = 7, Id = "4E25DF5D-3C01-4B39-B007-64302B02A5C0", Name = "Ethernet", Address = "192.168.1.10" };
             var scripts = new Dictionary<string, string>();
@@ -46,6 +55,9 @@ internal static class AdminTests
             scripts["undo"] = AdminConfigurator.BuildUndoScript(adapter);
             string malicious = "x'; Write-Output INJECTION; #";
             scripts["share-input-as-data"] = AdminConfigurator.BuildShareScript(directory, malicious, false);
+            scripts["share-specific"] = AdminConfigurator.BuildShareScript(directory, "Arquivos", false, "specific", "milena");
+            scripts["share-everyone"] = AdminConfigurator.BuildShareScript(directory, "Arquivos", true, "everyone", "");
+            scripts["share-account-as-data"] = AdminConfigurator.BuildShareScript(directory, "Arquivos", false, "specific", malicious);
             foreach (var item in scripts)
             {
                 Check(!item.Value.Contains(malicious), "User input leaked into executable PowerShell text");
@@ -55,6 +67,9 @@ internal static class AdminTests
                 var data = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(Convert.FromBase64String(match.Groups[1].Value)));
                 Check(data.ContainsKey("NetworkIdentitySource") && !data.ContainsKey("AssemblyPath"), "Missing embedded reader or stale executable path in request");
                 if (item.Key == "share-input-as-data") Check(Convert.ToString(data["ShareName"]) == malicious, "Input was not preserved as inert data");
+                if (item.Key == "share-specific") Check(Convert.ToString(data["Audience"]) == "specific" && Convert.ToString(data["Account"]) == "milena", "Specific account was not preserved as data");
+                if (item.Key == "share-everyone") Check(Convert.ToString(data["Audience"]) == "everyone" && Convert.ToBoolean(data["Writable"]), "Everyone audience or write mode lost");
+                if (item.Key == "share-account-as-data") Check(Convert.ToString(data["Account"]) == malicious, "Account input was not preserved as inert data");
                 string file = Path.Combine(directory, item.Key + ".ps1");
                 File.WriteAllText(file, item.Value, new UTF8Encoding(true));
                 ParseOnly(file);
@@ -76,6 +91,8 @@ internal static class AdminTests
             TestProfileGates(scripts["prepare-private"], directory);
             VerifyAtomicWriter(scripts["prepare-private"], directory);
             VerifyFpsRestoration(scripts["prepare-private"], directory);
+            VerifyShareAudienceGuards(scripts["share-specific"], directory);
+            VerifySharePipeline(scripts["share-specific"], directory);
 
             if (args.Length > 0 && args[0] == "--diagnose")
             {
@@ -94,7 +111,7 @@ internal static class AdminTests
                 Check(report.Contains("diagnose"), "Report operation mismatch");
                 Check(!report.Contains("preparação foi confirmada"), "Report indicates unintended prepare");
             }
-            Console.WriteLine("PASS: " + assertions + " assertions; 5 generated scripts parsed; profile gates and firewall matching tested with isolated mocks. No mutating Windows action was executed.");
+            Console.WriteLine("PASS: " + assertions + " assertions; " + scripts.Count + " generated scripts parsed; profile gates and firewall matching tested with isolated mocks. No mutating Windows action was executed.");
             return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine("FAIL: " + ex); return 1; }
@@ -115,6 +132,162 @@ internal static class AdminTests
             process.StandardOutput.ReadToEnd();
             process.WaitForExit();
             Check(process.ExitCode == 0, "PowerShell parse failed for " + path + ": " + error);
+        }
+    }
+
+    static void VerifyShareAudienceGuards(string script, string directory)
+    {
+        int boundary = script.IndexOf("\ntry {\n    switch ", StringComparison.Ordinal);
+        Check(boundary > 0, "Could not isolate share principal resolution");
+        string test = script.Substring(0, boundary) + @"
+function Check([bool]$value,[string]$message){if(!$value){throw $message};$script:audienceChecks++}
+function Rejected($action,[string]$message){$bad=$false;try{& $action|Out-Null}catch{$bad=$true};Check $bad $message}
+$script:audienceChecks=0
+$p.Audience='current';$p.Account=''
+$current=Resolve-SharePrincipal
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+Check ($current.Sid.Value -eq $identity.User.Value -and $current.Account -eq $identity.Name) 'Current identity changed'
+$p.Audience='everyone'
+$all=Resolve-SharePrincipal
+Check ($all.Sid.Value -eq 'S-1-1-0') 'Everyone did not resolve through its well-known SID'
+Check ((New-Object Security.Principal.NTAccount($all.Account)).Translate([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-1-0') 'Localized Everyone name maps to wrong SID'
+$p.Audience='specific';$p.Account=$identity.Name
+$specific=Resolve-SharePrincipal
+Check ($specific.Sid.Value -eq $identity.User.Value) 'Explicit account maps to a different principal'
+$p.Account=$env:USERNAME
+$localSid=$null
+try{$localSid=(New-Object Security.Principal.NTAccount($env:COMPUTERNAME+'\'+$env:USERNAME)).Translate([Security.Principal.SecurityIdentifier])}catch{}
+if($localSid){$simple=Resolve-SharePrincipal;Check ($simple.Sid.Value -eq $localSid.Value) 'Simple account did not resolve against this computer'}
+else{Rejected {Resolve-SharePrincipal} 'Missing same-name local account was not rejected'}
+$p.Account='.\'+$env:USERNAME
+if($localSid){$dot=Resolve-SharePrincipal;Check ($dot.Sid.Value -eq $localSid.Value) 'Dot-local account did not resolve against this computer'}
+else{Rejected {Resolve-SharePrincipal} 'Missing dot-local account was not rejected'}
+foreach($badMode in @('all','','Everyone')){$p.Audience=$badMode;Rejected {Resolve-SharePrincipal} 'Unknown mode resolved'}
+$p.Audience='specific'
+foreach($badAccount in @('',('a'+[char]10+'b'),'a/b','a\b\c','\a','a\',('a'*257))){$p.Account=$badAccount;Rejected {Resolve-SharePrincipal} 'Malformed account resolved'}
+$p.Account='RedeClaraMissing'+[Guid]::NewGuid().ToString('N')
+Rejected {Resolve-SharePrincipal} 'Nonexistent local user resolved'
+$p.Audience='specific';$p.Account=''
+$script:mutationAttempts=0
+function Is-Admin{return $true}
+function Take-Lock{$script:mutationAttempts++;throw 'UNEXPECTED_LOCK'}
+function Set-Acl{$script:mutationAttempts++;throw 'UNEXPECTED_ACL'}
+function New-SmbShare{$script:mutationAttempts++;throw 'UNEXPECTED_SHARE'}
+Rejected {Share} 'Invalid account was not rejected'
+Check ($script:mutationAttempts -eq 0) 'Invalid account reached a mutation boundary'
+[Console]::Out.WriteLine('SHARE_AUDIENCE_CASES_PASS='+$script:audienceChecks)
+";
+        string file = Path.Combine(directory, "share-audience-tests.ps1");
+        File.WriteAllText(file, test, new UTF8Encoding(true));
+        string exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+        var start = new ProcessStartInfo(exe, "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + file + "\"");
+        start.UseShellExecute = false; start.CreateNoWindow = true; start.RedirectStandardOutput = true; start.RedirectStandardError = true;
+        using (Process process = Process.Start(start))
+        {
+            string output = process.StandardOutput.ReadToEnd(); string error = process.StandardError.ReadToEnd(); process.WaitForExit();
+            Check(process.ExitCode == 0 && output.Contains("SHARE_AUDIENCE_CASES_PASS="), "Share audience resolution failed: " + output + error);
+            Console.Write(output);
+        }
+    }
+
+    static void VerifySharePipeline(string script, string directory)
+    {
+        int boundary = script.IndexOf("\ntry {\n    switch ", StringComparison.Ordinal);
+        Check(boundary > 0, "Could not isolate the real share pipeline");
+        string test = script.Substring(0, boundary) + @"
+function Check([bool]$value,[string]$message){if(!$value){throw $message};$script:pipelineChecks++}
+function Clone-Acl($acl){$copy=New-Object Security.AccessControl.DirectorySecurity;$copy.SetSecurityDescriptorSddlForm($acl.Sddl);return $copy}
+function Acl-RuleKeys($acl){return @($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])|ForEach-Object{[string]$_.IdentityReference.Value+'|'+$_.AccessControlType+'|'+[long]$_.FileSystemRights+'|'+[int]$_.InheritanceFlags+'|'+[int]$_.PropagationFlags})}
+function Is-Admin{return $true}
+function Take-Lock{$script:lockCalls++}
+function Get-Acl{[CmdletBinding()]param([string]$LiteralPath);Check ($LiteralPath -ceq $script:fixturePath) 'ACL read escaped fixture';return (Clone-Acl $script:mockAcl)}
+function Set-Acl{[CmdletBinding()]param([string]$LiteralPath,[Security.AccessControl.DirectorySecurity]$AclObject);Check ($LiteralPath -ceq $script:fixturePath) 'ACL write escaped fixture';$script:aclWrites++;$script:mockAcl=Clone-Acl $AclObject}
+function Get-FpsFirewallSnapshot{param([string]$store='PersistentStore');$script:fpsReads++;return @()}
+function Assert-FpsBaselineSupported{param($before,$templates);$script:fpsAssertions++}
+function Restore-FpsFirewallBaseline{param($before,$templates,$after,$checkpoint,$checkpointPath);$script:fpsRestores++;return [pscustomobject]@{Confirmed=$true}}
+function Write-JsonAtomic{param($path,$value);$script:snapshots+=($value|ConvertTo-Json -Depth 16|ConvertFrom-Json)}
+function Get-SmbShare{[CmdletBinding()]param([string]$Name);if($script:mockShare -and $script:mockShare.Name -ceq $Name){return $script:mockShare}}
+function New-SmbShare{
+    [CmdletBinding()]param([string]$Name,[string]$Path,[string]$Description,[string]$FolderEnumerationMode,[string]$CachingMode,[string[]]$ReadAccess,[string[]]$ChangeAccess,[string[]]$FullAccess)
+    $script:newCalls++;$script:newArgs=@{};foreach($key in $PSBoundParameters.Keys){$script:newArgs[$key]=$PSBoundParameters[$key]}
+    $script:mockShare=[pscustomobject]@{Name=$Name;Path=$Path;Description=$Description}
+    return $script:mockShare
+}
+function Get-SmbShareAccess{
+    [CmdletBinding()]param([string]$Name)
+    if($script:failureMode -eq 'throw'){throw 'INJECTED_ACCESS_QUERY_FAILURE'}
+    $right='Read';$account=''
+    if($script:newArgs.ContainsKey('ChangeAccess')){$right='Change';$account=[string]$script:newArgs.ChangeAccess[0]}
+    else{$account=[string]$script:newArgs.ReadAccess[0]}
+    if($script:failureMode -eq 'wrongSid'){$account=$script:wrongAccount}
+    return [pscustomobject]@{AccountName=$account;AccessControlType='Allow';AccessRight=$right}
+}
+function Remove-SmbShare{[CmdletBinding(SupportsShouldProcess=$true)]param([string]$Name,[switch]$Force);$script:removeCalls++;Check ($script:mockShare.Name -ceq $Name) 'Rollback targeted an unrelated share';$script:mockShare=$null}
+function Start-Sleep{param([int]$Milliseconds,[int]$Seconds)}
+$script:pipelineChecks=0;$script:pipelineCases=0
+$script:fixturePath=[IO.Path]::GetFullPath([string]$p.Folder).TrimEnd('\','/')
+$currentIdentity=[Security.Principal.WindowsIdentity]::GetCurrent()
+$specificSid=New-Object Security.Principal.SecurityIdentifier('S-1-5-19')
+if($specificSid.Value -eq $currentIdentity.User.Value){$specificSid=New-Object Security.Principal.SecurityIdentifier('S-1-5-20')}
+$specificAccount=$specificSid.Translate([Security.Principal.NTAccount]).Value
+$baseline=New-Object Security.AccessControl.DirectorySecurity
+$baseline.SetSecurityDescriptorSddlForm('D:AI(A;OICI;FA;;;SY)(A;OICI;FR;;;S-1-5-21-123-456-789-1100)')
+$originalSddl=$baseline.Sddl;$originalRules=@(Acl-RuleKeys $baseline)
+foreach($mode in @('current','specific','everyone')){
+    foreach($writable in @($false,$true)){
+        foreach($failure in @('none','wrongSid')){
+            $script:pipelineCases++;$case=$mode+'/'+$writable+'/'+$failure
+            $p.Audience=$mode;$p.Account='';if($mode -eq 'specific'){$p.Account=$specificAccount}
+            $p.Writable=$writable;$p.ShareName='RedeClaraPipelineFixture';$p.Token=[Guid]::NewGuid().ToString('N')
+            $principal=Resolve-SharePrincipal;$expectedSid=$principal.Sid.Value
+            if($mode -eq 'specific'){Check ($expectedSid -ne $currentIdentity.User.Value) 'Specific fixture accidentally uses the current user'}
+            if($mode -eq 'everyone'){Check ($expectedSid -eq 'S-1-1-0' -and $expectedSid -ne $currentIdentity.User.Value) 'Everyone silently fell back to current user'}
+            $wrongSid=New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+            if($wrongSid.Value -eq $expectedSid){$wrongSid=New-Object Security.Principal.SecurityIdentifier('S-1-5-20')}
+            $script:wrongAccount=$wrongSid.Translate([Security.Principal.NTAccount]).Value
+            $script:mockAcl=Clone-Acl $baseline;$script:mockShare=$null;$script:newArgs=@{};$script:snapshots=@()
+            $script:lockCalls=0;$script:aclWrites=0;$script:newCalls=0;$script:removeCalls=0;$script:fpsReads=0;$script:fpsAssertions=0;$script:fpsRestores=0
+            $script:success=$false;$script:message='';$script:details=New-Object 'System.Collections.Generic.List[string]';$script:failureMode=$failure
+            $errorText='';try{Share}catch{$errorText=$_.Exception.Message}
+            Check ($script:lockCalls -eq 1 -and $script:newCalls -eq 1) ('Real Share did not reach the expected mocked pipeline: '+$case+' '+$errorText)
+            Check (!$script:newArgs.ContainsKey('FullAccess')) ('Share escalated to full access: '+$case)
+            $key='ReadAccess';$other='ChangeAccess';$right='Read';$fileRight=[Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [Security.AccessControl.FileSystemRights]::Synchronize
+            if($writable){$key='ChangeAccess';$other='ReadAccess';$right='Change';$fileRight=[Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::Synchronize}
+            Check ($script:newArgs.ContainsKey($key) -and !$script:newArgs.ContainsKey($other) -and @($script:newArgs[$key]).Count -eq 1) ('Wrong SMB rights argument: '+$case)
+            $actualSid=(New-Object Security.Principal.NTAccount([string]$script:newArgs[$key][0])).Translate([Security.Principal.SecurityIdentifier]).Value
+            Check ($actualSid -eq $expectedSid) ('SMB grant used the wrong SID: '+$case)
+            Check ($script:snapshots.Count -gt 2 -and $script:snapshots[0].OriginalSddl -ceq $originalSddl -and $script:snapshots[0].Sid -eq $expectedSid -and $script:snapshots[0].Audience -eq $mode -and $script:snapshots[0].ShareRight -eq $right) ('Snapshot omitted the selected audience: '+$case)
+            Check ($script:fpsAssertions -eq 1 -and $script:fpsRestores -ge 2) ('Share skipped the firewall preservation pipeline: '+$case)
+            if($failure -eq 'none'){
+                Check (!$errorText -and $script:success -and $null -ne $script:mockShare -and $script:removeCalls -eq 0) ('Share did not succeed in memory: '+$case+' '+$errorText)
+                Check ($script:aclWrites -eq 1) ('Expected exactly one scoped ACL grant: '+$case)
+                $grants=@($script:mockAcl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])|Where-Object{$_.IdentityReference.Value -eq $expectedSid -and $_.AccessControlType -eq 'Allow' -and [long]$_.FileSystemRights -eq [long]$fileRight -and [int]$_.InheritanceFlags -eq 3 -and [int]$_.PropagationFlags -eq 0})
+                Check ($grants.Count -eq 1) ('Selected SID did not receive exact NTFS rights: '+$case)
+                $afterRules=@(Acl-RuleKeys $script:mockAcl)
+                foreach($rule in $originalRules){Check ($afterRules -contains $rule) ('Existing ACL grant removed or changed: '+$case)}
+            }else{
+                Check ($errorText -match 'conta autorizada' -and !$script:success) ('Wrong SMB SID was accepted: '+$case+' '+$errorText)
+                Check ($null -eq $script:mockShare -and $script:removeCalls -eq 1) ('Failed verification retained its new share: '+$case)
+                Check ($script:aclWrites -eq 2 -and $script:mockAcl.Sddl -ceq $originalSddl) ('Failed verification did not restore exact ACL baseline: '+$case)
+            }
+        }
+    }
+}
+$p.Audience='specific';$p.Account='RedeClaraMissing'+[Guid]::NewGuid().ToString('N');$script:lockCalls=0;$script:newCalls=0;$script:aclWrites=0
+$rejected=$false;try{Share}catch{$rejected=$true}
+Check ($rejected -and $script:lockCalls -eq 0 -and $script:newCalls -eq 0 -and $script:aclWrites -eq 0) 'Nonexistent principal crossed a mutation boundary'
+[Console]::Out.WriteLine('SHARE_PIPELINE_CASES_PASS='+$script:pipelineCases+';ASSERTIONS='+$script:pipelineChecks)
+";
+        string file = Path.Combine(directory, "share-pipeline-tests.ps1");
+        File.WriteAllText(file, test, new UTF8Encoding(true));
+        string exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+        var start = new ProcessStartInfo(exe, "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + file + "\"");
+        start.UseShellExecute = false; start.CreateNoWindow = true; start.RedirectStandardOutput = true; start.RedirectStandardError = true;
+        using (Process process = Process.Start(start))
+        {
+            string output = process.StandardOutput.ReadToEnd(); string error = process.StandardError.ReadToEnd(); process.WaitForExit();
+            Check(process.ExitCode == 0 && output.Contains("SHARE_PIPELINE_CASES_PASS=12;"), "Full in-memory share pipeline failed: " + output + error);
+            Console.Write(output);
         }
     }
 
@@ -327,6 +500,7 @@ $aclDecision=$source.Substring($decisionStart,$decisionEnd-$decisionStart)
 $userSid=New-Object Security.Principal.SecurityIdentifier('S-1-5-21-1-2-3-1001')
 $adminSid=New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
 $identity=[pscustomobject]@{User=$userSid;Groups=@($adminSid)}
+$sid=$userSid;$audience='current'
 $rights=[Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [Security.AccessControl.FileSystemRights]::Synchronize
 foreach($case in @('AdministratorsOnly','ExplicitUser','InheritedUser','AdministratorsDeny')) {
     $acl=New-Object Security.AccessControl.DirectorySecurity
@@ -349,6 +523,32 @@ foreach($case in @('AdministratorsOnly','ExplicitUser','InheritedUser','Administ
     else {if($needsAcl) {throw ('Existing user SID rights were incorrectly ignored: '+$case)}}
 }
 [Console]::Out.WriteLine('PASS: 4 in-memory NTFS cases preserve group Deny and require user SID Allow')
+$specificSid=New-Object Security.Principal.SecurityIdentifier('S-1-5-21-1-2-3-1002')
+$everyoneSid=New-Object Security.Principal.SecurityIdentifier('S-1-1-0')
+foreach($case in @('SpecificNeedsOwnAce','SpecificHasOwnAce','EveryoneNeedsOwnAce','EveryoneHasOwnAce','SpecificUnknownDeny','EveryoneUnknownDeny')) {
+    $audience='specific';$sid=$specificSid
+    if($case.StartsWith('Everyone')){$audience='everyone';$sid=$everyoneSid}
+    $acl=New-Object Security.AccessControl.DirectorySecurity
+    $oldGrant=New-Object Security.AccessControl.FileSystemAccessRule($userSid,[Security.AccessControl.FileSystemRights]::FullControl,([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit),[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow)
+    $acl.AddAccessRule($oldGrant)|Out-Null
+    if($case.EndsWith('HasOwnAce')) {
+        $own=New-Object Security.AccessControl.FileSystemAccessRule($sid,$rights,([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit),[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow)
+        $acl.AddAccessRule($own)|Out-Null
+    }
+    if($case.EndsWith('UnknownDeny')) {
+        $unknown=New-Object Security.Principal.SecurityIdentifier('S-1-5-21-1-2-3-1010')
+        $denyRule=New-Object Security.AccessControl.FileSystemAccessRule($unknown,$rights,[Security.AccessControl.AccessControlType]::Deny)
+        $acl.AddAccessRule($denyRule)|Out-Null
+    }
+    $before=$acl.Sddl;$denied=$false
+    try { Invoke-Expression $aclDecision } catch { if($_.Exception.Message -match 'negação NTFS') {$denied=$true} else {throw} }
+    if($case.EndsWith('UnknownDeny')) {if(!$denied){throw ('Unverifiable group deny ignored: '+$case)}}
+    elseif($denied){throw ('Unexpected selected-principal denial: '+$case)}
+    elseif($case.EndsWith('NeedsOwnAce')){if(!$needsAcl){throw ('Old current-user grant satisfied a different SID: '+$case)}}
+    elseif($needsAcl){throw ('Selected SID explicit grant ignored: '+$case)}
+    if($acl.Sddl -cne $before){throw 'Access decision mutated an ACL'}
+}
+[Console]::Out.WriteLine('PASS: 6 selected-principal NTFS cases require exact SID and preserve unknown Deny')
 ".Replace("__SOURCE__", sourcePath.Replace("'", "''"));
         string file = Path.Combine(directory, "profile-guard-fixture.ps1");
         File.WriteAllText(file, fixture, new UTF8Encoding(true));

@@ -1,5 +1,12 @@
 # Histórico de versões
 
+## 0.1.3 — 27/10/2026
+
+- Ao compartilhar uma pasta, permite escolher a conta atual, um usuário específico ou Todos.
+- Configura e verifica as permissões do compartilhamento e da pasta para o destinatário escolhido, com leitura por padrão e alteração opcional.
+- Valida o usuário antes de aplicar mudanças e identifica Todos independentemente do idioma do Windows.
+- Explica que o Windows pode reutilizar uma conexão existente sem mostrar um novo login; mantém as políticas de autenticação e as permissões anteriores.
+
 ## 0.1.2 — 27/10/2026
 
 - Corrige o carregamento do leitor de identidade da rede no PowerShell, sem carregar o executável por um caminho remoto.

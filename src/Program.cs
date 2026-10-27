@@ -164,6 +164,9 @@ namespace RedeClara
             Wire("UndoButton", async delegate { await Undo(); });
             Wire("BrowseFolder", BrowseFolder);
             Wire("CreateShareButton", async delegate { await CreateShare(); });
+            C<RadioButton>("ShareCurrentRadio").Checked += delegate { UpdateShareAudience(); };
+            C<RadioButton>("ShareSpecificRadio").Checked += delegate { UpdateShareAudience(); };
+            C<RadioButton>("ShareEveryoneRadio").Checked += delegate { UpdateShareAudience(); };
             Wire("EnterFolderButton", async delegate { await EnterSelectedFolder(); });
             Wire("OpenShare", delegate { OpenSelectedInWindows(); });
             Wire("CopyPath", delegate { if (CurrentPath() != null) { Clipboard.SetText(CurrentPath()); Footer("Caminho copiado."); } });
@@ -225,6 +228,7 @@ namespace RedeClara
             };
             C<CheckBox>("ReducedMotion").Checked += delegate { NormalizeMotion(Window); };
             Text("AccountText", Environment.UserDomainName + @"\" + Environment.UserName);
+            UpdateShareAudience();
             Text("AdminBadge", AdminConfigurator.IsAdministrator() ? "Administrador ativo" : "Modo de diagnóstico");
             Text("VersionText", "Windows · v" + AutoUpdater.CurrentVersion.ToString(3));
             activePage = C<Grid>("NetworkPage");
@@ -305,6 +309,7 @@ namespace RedeClara
         {
             preparing = value;
             foreach (string b in new[] { "PrepareButton", "TrustButton", "DiagnoseButton", "UndoButton", "ReloadAdapters", "CreateShareButton" }) C<Button>(b).IsEnabled = !value;
+            foreach (string name in new[] { "BrowseFolder", "FolderPath", "ShareName", "ShareCurrentRadio", "ShareSpecificRadio", "ShareEveryoneRadio", "ShareAccountName", "ReadOnlyRadio", "WritableRadio" }) C<Control>(name).IsEnabled = !value;
             C<ComboBox>("AdapterBox").IsEnabled = !value && !scanning && !loadingAdapters;
         }
         void ShowSetup(SetupResult result)
@@ -649,14 +654,44 @@ namespace RedeClara
                 C<TextBox>("ShareName").Text = new DirectoryInfo(dialog.SelectedPath).Name;
             }
         }
+        string ShareAudience
+        {
+            get { return C<RadioButton>("ShareSpecificRadio").IsChecked == true ? "specific" : C<RadioButton>("ShareEveryoneRadio").IsChecked == true ? "everyone" : "current"; }
+        }
+        void UpdateShareAudience()
+        {
+            string audience = ShareAudience;
+            foreach (string name in new[] { "CurrentAccountPanel", "SpecificAccountPanel", "EveryoneAccessNotice" })
+            {
+                var panel = C<FrameworkElement>(name);
+                bool visible = name == (audience == "specific" ? "SpecificAccountPanel" : audience == "everyone" ? "EveryoneAccessNotice" : "CurrentAccountPanel");
+                bool reveal = visible && panel.Visibility != Visibility.Visible;
+                panel.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+                // Keyboard navigation remains immediate; mouse selection uses the existing reveal motion.
+                if (reveal)
+                {
+                    if (Reduced || Mouse.LeftButton == MouseButtonState.Pressed) Reveal(panel, 0);
+                    else { panel.BeginAnimation(UIElement.OpacityProperty, null); panel.Opacity = 1; panel.RenderTransform = Transform.Identity; }
+                }
+            }
+            Text("CreateShareMessage", audience == "specific" ? "Informe o usuário que terá acesso à pasta escolhida." : audience == "everyone" ? "O acesso será ampliado para Todos com a permissão escolhida." : "O acesso será criado para a conta atual com a permissão escolhida.");
+        }
         async Task CreateShare()
         {
             if (preparing) return;
+            string audience = ShareAudience;
+            string account = C<TextBox>("ShareAccountName").Text.Trim();
+            if (audience == "specific" && string.IsNullOrWhiteSpace(account))
+            {
+                Text("CreateShareMessage", "Informe o usuário deste computador que terá acesso à pasta.");
+                C<TextBox>("ShareAccountName").Focus();
+                return;
+            }
             BusySetup(true);
             Text("CreateShareMessage", "Configurando a pasta e suas permissões…");
             try
             {
-                var result = await AdminConfigurator.CreateShareAsync(C<TextBox>("FolderPath").Text, C<TextBox>("ShareName").Text, C<RadioButton>("WritableRadio").IsChecked == true);
+                var result = await AdminConfigurator.CreateShareAsync(C<TextBox>("FolderPath").Text, C<TextBox>("ShareName").Text, C<RadioButton>("WritableRadio").IsChecked == true, audience, account);
                 Text("CreateShareMessage", result.Message);
                 Footer(result.Message);
             }

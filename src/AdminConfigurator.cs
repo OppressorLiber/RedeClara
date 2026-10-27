@@ -73,11 +73,29 @@ namespace RedeClara
 
         public static Task<SetupResult> CreateShareAsync(string folder, string name, bool writable)
         {
+            return CreateShareAsync(folder, name, writable, "current", null);
+        }
+
+        public static Task<SetupResult> CreateShareAsync(string folder, string name, bool writable, string audience, string account)
+        {
             string error = ValidateShareInput(folder, name);
             if (error != null) return Task.FromResult(Failure(error));
+            error = ValidateShareAudience(audience, account);
+            if (error != null) return Task.FromResult(Failure(error));
             if (!IsAdministrator()) return Task.FromResult(Failure("Abra o Rede Clara como administrador para compartilhar uma pasta."));
-            Request request = MakeRequest("share", null, false, Path.GetFullPath(folder), name, writable);
+            Request request = MakeRequest("share", null, false, Path.GetFullPath(folder), name, writable, audience, account);
             return Task.Factory.StartNew(delegate { return Run(request); });
+        }
+
+        public static string ValidateShareAudience(string audience, string account)
+        {
+            if (audience != "current" && audience != "specific" && audience != "everyone") return "Escolha a conta atual, um usuário específico ou Todos.";
+            if (audience != "specific") return null;
+            if (string.IsNullOrWhiteSpace(account) || account.Length > 256 || account != account.Trim()) return "Informe um usuário de até 256 caracteres, sem espaços nas pontas.";
+            foreach (char c in account) if (char.IsControl(c)) return "O usuário contém um caractere de controle.";
+            int separator = account.IndexOf('\\');
+            if (account.IndexOf('/') >= 0 || separator == 0 || separator == account.Length - 1 || (separator >= 0 && account.IndexOf('\\', separator + 1) >= 0)) return "Use usuario, PC\\usuario, dominio\\usuario ou MicrosoftAccount\\email.";
+            return null;
         }
 
         static string ValidateAdapter(AdapterInfo adapter)
@@ -141,8 +159,9 @@ namespace RedeClara
         public static string BuildDiagnosticScript(AdapterInfo adapter) { return MakeRequest("diagnose", adapter, false, null, null, false).Script; }
         public static string BuildUndoScript(AdapterInfo adapter) { return MakeRequest("undo", adapter, false, null, null, false).Script; }
         public static string BuildShareScript(string folder, string name, bool writable) { return MakeRequest("share", null, false, folder, name, writable).Script; }
+        public static string BuildShareScript(string folder, string name, bool writable, string audience, string account) { return MakeRequest("share", null, false, folder, name, writable, audience, account).Script; }
 
-        static Request MakeRequest(string operation, AdapterInfo adapter, bool trustPublic, string folder, string name, bool writable)
+        static Request MakeRequest(string operation, AdapterInfo adapter, bool trustPublic, string folder, string name, bool writable, string audience = "current", string account = null)
         {
             string token = Guid.NewGuid().ToString("N");
             string report = Path.Combine(DataRoot, "Reports", DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + "-" + operation + "-" + token + ".json");
@@ -160,6 +179,8 @@ namespace RedeClara
             parameters["Folder"] = folder ?? "";
             parameters["ShareName"] = name ?? "";
             parameters["Writable"] = writable;
+            parameters["Audience"] = audience;
+            parameters["Account"] = account ?? "";
             string data = Convert.ToBase64String(Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(parameters)));
             return new Request { Token = token, ReportPath = report, Timeout = operation == "share" ? 120000 : TimeoutMilliseconds, Script = "$p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + data + "')) | ConvertFrom-Json\r\n" + CommonScript + OperationScript + FinalScript };
         }
@@ -671,8 +692,33 @@ function Undo {
     if ($skipped) { $script:message='Restauração parcial: configurações modificadas ou em uso foram preservadas. Consulte os detalhes.' }
     else { $script:message='As alterações registradas para esta conexão foram desfeitas e verificadas.' }
 }
+function Resolve-SharePrincipal {
+    $audience=[string]$p.Audience
+    if ($audience -cnotin @('current','specific','everyone')) { throw 'Escolha a conta atual, um usuário específico ou Todos.' }
+    if ($audience -ceq 'current') {
+        $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+        return [pscustomobject]@{ Account=$identity.Name; Sid=$identity.User; Audience=$audience }
+    }
+    if ($audience -ceq 'everyone') {
+        $sid=New-Object Security.Principal.SecurityIdentifier('S-1-1-0')
+        return [pscustomobject]@{ Account=$sid.Translate([Security.Principal.NTAccount]).Value; Sid=$sid; Audience=$audience }
+    }
+    $account=[string]$p.Account
+    if ([string]::IsNullOrWhiteSpace($account) -or $account.Length -gt 256 -or $account -cne $account.Trim() -or $account -match '[\x00-\x1f\x7f-\x9f/]' -or $account.StartsWith('\') -or $account.EndsWith('\') -or @($account.ToCharArray() | Where-Object { $_ -eq '\' }).Count -gt 1) { throw 'Informe um usuário válido: usuario, PC\usuario, dominio\usuario ou MicrosoftAccount\email.' }
+    if ($account.StartsWith('.\',[StringComparison]::Ordinal)) { $account=$env:COMPUTERNAME+'\'+$account.Substring(2) }
+    elseif (!$account.Contains('\')) { $account=$env:COMPUTERNAME+'\'+$account }
+    try {
+        $sid=(New-Object Security.Principal.NTAccount($account)).Translate([Security.Principal.SecurityIdentifier])
+        $canonical=$sid.Translate([Security.Principal.NTAccount]).Value
+        return [pscustomobject]@{ Account=$canonical; Sid=$sid; Audience=$audience }
+    } catch { throw ('O Windows não encontrou a conta '+$account+'. Use uma conta existente neste computador ou um domínio reconhecido; para conta Microsoft, use MicrosoftAccount\email.') }
+}
 function Share {
     if (!(Is-Admin)) { throw 'Compartilhar uma pasta exige privilégios de administrador.' }
+    $principal=Resolve-SharePrincipal
+    $audience=$principal.Audience
+    $account=$principal.Account
+    $sid=$principal.Sid
     $name=[string]$p.ShareName
     if ([string]::IsNullOrWhiteSpace($name) -or $name.Length -gt 80 -or $name -ne $name.Trim() -or $name.EndsWith('.') -or $name -eq '.' -or $name -eq '..' -or $name -match '[\x00-\x1f$""\\/\[\]:;|=,+*?<>]') { throw 'Nome de compartilhamento inválido.' }
     $folder=[IO.Path]::GetFullPath([string]$p.Folder).TrimEnd('\','/')
@@ -688,8 +734,6 @@ function Share {
     Take-Lock
     if (@(Get-SmbShare -Name $name -ErrorAction SilentlyContinue).Count) { throw 'Já existe um compartilhamento com este nome. Ele foi preservado; escolha outro nome.' }
     $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
-    $account=$identity.Name
-    $sid=$identity.User
     $acl=Get-Acl -LiteralPath $folder
     $originalSddl=$acl.Sddl
     $rights=[Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [Security.AccessControl.FileSystemRights]::Synchronize
@@ -698,23 +742,23 @@ function Share {
     $sids=@($identity.User.Value)+@($identity.Groups | ForEach-Object {$_.Value})
     [long]$allow=0; [long]$inheritable=0; [long]$deny=0
     foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
-        if ($sids -contains $rule.IdentityReference.Value) {
-            if ($rule.AccessControlType -eq 'Deny') { $deny=$deny -bor [long]$rule.FileSystemRights }
+        if ($rule.AccessControlType -eq 'Deny' -and ($audience -ne 'current' -or $sids -contains $rule.IdentityReference.Value)) { $deny=$deny -bor [long]$rule.FileSystemRights }
+        if ($rule.IdentityReference.Value -eq $sid.Value) {
             # Administrative group Allow ACEs can disappear from a remote UAC-filtered token.
             # Existing Allow rights count only when they belong to the actual shared user SID.
-            elseif ($rule.IdentityReference.Value -eq $identity.User.Value -and !($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) {
+            if ($rule.AccessControlType -eq 'Allow' -and !($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) {
                 $allow=$allow -bor [long]$rule.FileSystemRights
                 if (($rule.InheritanceFlags -band 3) -eq 3) { $inheritable=$inheritable -bor [long]$rule.FileSystemRights }
             }
         }
     }
-    if (($deny -band [long]$rights) -ne 0) { throw 'Há uma negação NTFS aplicável à conta selecionada. Ela foi preservada; selecione outra pasta ou revise suas permissões.' }
+    if (($deny -band [long]$rights) -ne 0) { throw 'Há uma negação NTFS que impede confirmar este acesso com segurança. Ela foi preservada; selecione outra pasta ou revise suas permissões. Para outro usuário ou Todos, o aplicativo não remove nem ignora negações de grupos.' }
     $needsAcl=(($allow -band [long]$rights) -ne [long]$rights -or ($inheritable -band [long]$rights) -ne [long]$rights)
     $fpsBefore=@(Get-FpsFirewallSnapshot)
     $fpsTemplates=@(Get-FpsFirewallSnapshot 'SystemDefaults')
     Assert-FpsBaselineSupported $fpsBefore $fpsTemplates
     $snapshotPath=Join-Path $p.Root ('Shares\'+$p.Token+'.json')
-    $snapshot=[pscustomobject]@{ Computer=$env:COMPUTERNAME; Account=$account; Sid=$sid.Value; Path=$folder; ShareName=$name; ShareRight=$shareRight; OriginalSddl=$originalSddl; AppliedSddl=''; AclChanged=$false; Created=$false; Token=$p.Token; FpsBefore=$fpsBefore; FpsSystemDefaults=$fpsTemplates; FpsAfterCreate=@(); FpsAfterRollback=@(); FpsPendingPlan=$null; FpsRestoration=$null; FpsFinalVerification=$null; FpsRestored=$false; FpsRestorationError='' }
+    $snapshot=[pscustomobject]@{ Computer=$env:COMPUTERNAME; Audience=$audience; Account=$account; Sid=$sid.Value; Path=$folder; ShareName=$name; ShareRight=$shareRight; OriginalSddl=$originalSddl; AppliedSddl=''; AclChanged=$false; Created=$false; Token=$p.Token; FpsBefore=$fpsBefore; FpsSystemDefaults=$fpsTemplates; FpsAfterCreate=@(); FpsAfterRollback=@(); FpsPendingPlan=$null; FpsRestoration=$null; FpsFinalVerification=$null; FpsRestored=$false; FpsRestorationError='' }
     Write-JsonAtomic $snapshotPath $snapshot
     $aclChanged=$false; $created=$false; $creationAttempted=$false; $appliedSddl=''
     $description='Criado pelo Rede Clara '+$p.Token
@@ -757,12 +801,13 @@ function Share {
         }
         Say ('Pasta: '+$folder)
         Say ('Acesso de rede: \\'+$env:COMPUTERNAME+'\'+$name)
-        Say ('Única conta autorizada no compartilhamento: '+$account+'; permissão: '+$shareRight+'. A senha dessa conta continua obrigatória conforme a política atual do Windows.')
+        Say ('Destinatário autorizado no compartilhamento: '+$account+'; SID: '+$sid.Value+'; permissão: '+$shareRight+'.')
+        Say 'Políticas de autenticação preservadas; o Windows pode reutilizar uma conexão existente. Todos define quem pode acessar; não cria uma conta nem ativa acesso anônimo.'
         Say ('Snapshot das permissões anteriores: '+$snapshotPath)
         Say 'Regras internas de Compartilhamento de Arquivos e Impressoras conferidas e preservadas após a ativação automática do Windows; somente as regras próprias de escopo local permanecem adicionais.'
         Say 'Permissões próprias de arquivos e subpastas podem limitar o acesso a itens individuais. A restauração de rede não apaga este compartilhamento.'
         $script:success=$true
-        $script:message='Pasta compartilhada e acesso da sua conta verificado.'
+        $script:message='Pasta compartilhada; permissões verificadas para '+$account+'.'
     } finally {
         if($creationAttempted) {
             try {
