@@ -31,6 +31,11 @@ namespace RedeClara
             try
             {
                 if (AutoUpdater.TryHandleCommand(args)) return 0;
+                if (args.Length == 0 && ExecutableLocation.IsNetwork(Assembly.GetEntryAssembly().Location))
+                {
+                    MessageBox.Show("Abra uma cópia local do Rede Clara neste computador.\n\nO arquivo foi aberto por uma pasta de rede. Feche esta cópia, copie RedeClara.exe para a Área de Trabalho ou Downloads deste PC e abra o arquivo copiado.\n\nAssim a preparação e as atualizações serão executadas a partir de um arquivo local.", "Abra o Rede Clara neste PC", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return 0;
+                }
                 if (args.Length == 2 && args[0] == "--check-update")
                 {
                     File.WriteAllText(args[1], Json.Serialize(AutoUpdater.CheckAsync().GetAwaiter().GetResult()), Encoding.UTF8);

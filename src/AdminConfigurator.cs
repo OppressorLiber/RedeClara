@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Security.Principal;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
@@ -31,69 +30,19 @@ namespace RedeClara
                 return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
         }
 
-        // INetwork.GetNetworkId is a GUID retval, which PowerShell's late-bound COM marshaler
-        // cannot read reliably. These typed, read-only calls also work without elevation.
+        // Keep the public reader for callers; PowerShell compiles the same embedded implementation.
         public static string[] ReadNetworkIdentity(string adapterId)
         {
-            Guid expected = Guid.Parse(adapterId);
-            object managerObject = null;
-            object connectionsObject = null;
-            string[] result = null;
-            try
+            return NetworkIdentityInterop.ReadNetworkIdentity(adapterId);
+        }
+
+        static string ReadNetworkIdentitySource()
+        {
+            using (Stream resource = typeof(AdminConfigurator).Assembly.GetManifestResourceStream("RedeClara.NetworkIdentityInterop.cs"))
             {
-                managerObject = Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("DCB00C01-570F-4A9B-8D69-199FDBA5723B")));
-                connectionsObject = ((INetworkListManagerRead)managerObject).GetNetworkConnections();
-                foreach (object connectionObject in (System.Collections.IEnumerable)connectionsObject)
-                {
-                    object networkObject = null;
-                    try
-                    {
-                        var connection = (INetworkConnectionRead)connectionObject;
-                        if (!connection.IsConnected || connection.GetAdapterId() != expected) continue;
-                        networkObject = connection.GetNetwork();
-                        var network = (INetworkRead)networkObject;
-                        Guid identity = network.GetNetworkId();
-                        string name = network.GetName();
-                        if (identity == Guid.Empty || string.IsNullOrWhiteSpace(name)) throw new InvalidOperationException("A identidade do perfil de rede está indisponível.");
-                        string key = identity.ToString("D");
-                        if (result != null && !string.Equals(result[0], key, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Há mais de um perfil de rede conectado nesta interface; a operação automática foi bloqueada.");
-                        result = new[] { key, name };
-                    }
-                    finally { ReleaseCom(networkObject); ReleaseCom(connectionObject); }
-                }
-                if (result == null) throw new InvalidOperationException("Nenhum perfil de rede conectado corresponde à interface selecionada.");
-                return result;
+                if (resource == null) throw new InvalidOperationException("A implementação de leitura do perfil de rede está ausente do aplicativo.");
+                using (var reader = new StreamReader(resource, Encoding.UTF8, true)) return reader.ReadToEnd();
             }
-            finally { ReleaseCom(connectionsObject); ReleaseCom(managerObject); }
-        }
-
-        static void ReleaseCom(object value) { if (value != null && Marshal.IsComObject(value)) Marshal.ReleaseComObject(value); }
-
-        [ComImport, Guid("DCB00000-570F-4A9B-8D69-199FDBA5723B"), InterfaceType(ComInterfaceType.InterfaceIsDual)]
-        interface INetworkListManagerRead
-        {
-            [return: MarshalAs(UnmanagedType.Interface)] object GetNetworks(int flags);
-            [return: MarshalAs(UnmanagedType.Interface)] object GetNetwork(Guid networkId);
-            [return: MarshalAs(UnmanagedType.Interface)] object GetNetworkConnections();
-        }
-        [ComImport, Guid("DCB00005-570F-4A9B-8D69-199FDBA5723B"), InterfaceType(ComInterfaceType.InterfaceIsDual)]
-        interface INetworkConnectionRead
-        {
-            [return: MarshalAs(UnmanagedType.Interface)] object GetNetwork();
-            bool IsConnectedToInternet { [return: MarshalAs(UnmanagedType.VariantBool)] get; }
-            bool IsConnected { [return: MarshalAs(UnmanagedType.VariantBool)] get; }
-            int GetConnectivity();
-            Guid GetConnectionId();
-            Guid GetAdapterId();
-        }
-        [ComImport, Guid("DCB00002-570F-4A9B-8D69-199FDBA5723B"), InterfaceType(ComInterfaceType.InterfaceIsDual)]
-        interface INetworkRead
-        {
-            [return: MarshalAs(UnmanagedType.BStr)] string GetName();
-            void SetName([MarshalAs(UnmanagedType.BStr)] string name);
-            [return: MarshalAs(UnmanagedType.BStr)] string GetDescription();
-            void SetDescription([MarshalAs(UnmanagedType.BStr)] string description);
-            Guid GetNetworkId();
         }
 
         public static Task<SetupResult> PrepareAsync(AdapterInfo adapter, bool trustPublic)
@@ -201,7 +150,7 @@ namespace RedeClara
             parameters["Operation"] = operation;
             parameters["Token"] = token;
             parameters["Root"] = DataRoot;
-            parameters["AssemblyPath"] = typeof(AdminConfigurator).Assembly.Location;
+            parameters["NetworkIdentitySource"] = ReadNetworkIdentitySource();
             parameters["Report"] = report;
             parameters["InterfaceIndex"] = adapter == null ? 0 : adapter.InterfaceIndex;
             parameters["AdapterId"] = adapter == null ? "" : (adapter.Id ?? "");
@@ -324,8 +273,8 @@ function Get-Selection {
     $profiles = @(Get-NetConnectionProfile -InterfaceIndex ([int]$p.InterfaceIndex))
     if ($profiles.Count -ne 1) { throw 'Não foi possível identificar um único perfil de rede para esta conexão.' }
     $profile=$profiles[0]
-    if (!(('RedeClara.AdminConfigurator' -as [type]))) { $null=[Reflection.Assembly]::LoadFrom([string]$p.AssemblyPath) }
-    $networkIdentity=[RedeClara.AdminConfigurator]::ReadNetworkIdentity($id)
+    if (!(('RedeClara.NetworkIdentityInterop' -as [type]))) { Add-Type -TypeDefinition ([string]$p.NetworkIdentitySource) -Language CSharp -ErrorAction Stop }
+    $networkIdentity=[RedeClara.NetworkIdentityInterop]::ReadNetworkIdentity($id)
     if ([string]$networkIdentity[1] -cne [string]$profile.Name) { throw 'O perfil de rede mudou durante a leitura. Atualize a seleção.' }
     return [pscustomobject]@{ Adapter=$adapter; Profile=$profile; Id=$id; NetworkId=[string]$networkIdentity[0]; ProfileName=[string]$profile.Name; InterfaceAlias=[string]$adapter.Name }
 }

@@ -12,6 +12,8 @@ Um aplicativo Windows para encontrar computadores da rede local, consultar suas 
 
 Windows 10/11 x64 com .NET Framework 4.8 e Windows PowerShell 5.1. Não exige Python, Node ou um navegador para funcionar. O UAC é solicitado pelo manifesto do executável.
 
+Em cada computador, execute uma cópia local do arquivo, por exemplo na Área de Trabalho ou em Downloads. Se transferir o app pela rede, copie-o primeiro para o PC de destino. Abrir diretamente por `\\computador\pasta` ou por uma unidade de rede mostra uma orientação antes da preparação.
+
 ## O que faz
 
 - Busca IPv4 por ICMP e TCP/445, com 32 consultas simultâneas, limite de tempo e cancelamento.
@@ -45,6 +47,8 @@ SMB1 não é habilitado. O app preserva as políticas atuais de senha, acesso de
 O compilador do .NET Framework do Windows gera `dist/RedeClara.exe`; não há pacotes NuGet nem bibliotecas de terceiros no executável. `build.ps1 -QA` gera uma compilação de diagnóstico sem manifesto administrativo, usada para verificar a interface e a busca sem alterar a configuração da rede.
 
 `test.ps1` prepara sua própria compilação de diagnóstico antes de testar. `package.ps1` gera executável, ZIP e checksums. O teste administrativo elevado em `tests/ElevatedSetupTests.cs` é manual e separado da suíte comum; sua execução explícita altera a configuração da rede privada selecionada.
+
+Ao compilar esse teste elevado manualmente, inclua `src/NetworkIdentityInterop.cs` entre as fontes e `/resource:src\NetworkIdentityInterop.cs,RedeClara.NetworkIdentityInterop.cs` nos argumentos do compilador, além de Models, AdminConfigurator e NetworkDiscovery. A suíte comum já inclui a fonte e esse recurso automaticamente.
 
 ## Publicar atualizações
 

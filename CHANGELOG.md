@@ -1,5 +1,11 @@
 # Histórico de versões
 
+## 0.1.2 — 27/10/2026
+
+- Corrige o carregamento do leitor de identidade da rede no PowerShell, sem carregar o executável por um caminho remoto.
+- Ao abrir o app através de uma pasta de rede ou unidade mapeada, mostra uma orientação para copiar e abrir o arquivo localmente, antes de iniciar a preparação.
+- Mantém as verificações do perfil Windows e as políticas de segurança do .NET/PowerShell.
+
 ## 0.1.1 — 27/10/2026
 
 - Novo botão **Trocar conta** para resolver conflito de credenciais do Windows (1219), encerrando somente conexões ociosas com o computador selecionado.

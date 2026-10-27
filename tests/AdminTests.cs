@@ -49,9 +49,11 @@ internal static class AdminTests
             foreach (var item in scripts)
             {
                 Check(!item.Value.Contains(malicious), "User input leaked into executable PowerShell text");
+                Check(!item.Value.Contains("LoadFrom") && !item.Value.Contains("AssemblyPath"), "PowerShell still depends on loading the executable assembly");
                 var match = Regex.Match(item.Value, "FromBase64String\\('([^']+)'\\)");
                 Check(match.Success, "Missing encoded parameter envelope");
                 var data = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(Convert.FromBase64String(match.Groups[1].Value)));
+                Check(data.ContainsKey("NetworkIdentitySource") && !data.ContainsKey("AssemblyPath"), "Missing embedded reader or stale executable path in request");
                 if (item.Key == "share-input-as-data") Check(Convert.ToString(data["ShareName"]) == malicious, "Input was not preserved as inert data");
                 string file = Path.Combine(directory, item.Key + ".ps1");
                 File.WriteAllText(file, item.Value, new UTF8Encoding(true));
