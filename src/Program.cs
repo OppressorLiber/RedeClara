@@ -512,7 +512,7 @@ namespace RedeClara
                 count = filtered.Count; total = folderEntries.Count; empty = count == 0;
                 message = term.Length > 0 ? "Nenhum item corresponde à busca nesta pasta." : "Esta pasta está vazia.";
             }
-            if (browserError != 0) message = browserMessage + "\n\nUse uma conta com permissão neste computador ou atualize para tentar novamente.";
+            if (browserError != 0) message = browserMessage + (browserError == 1219 ? "" : "\n\nUse uma conta com permissão neste computador ou atualize para tentar novamente.");
             Text("ShareMessage", message);
             Text("FolderCount", count + (browsePath == null ? " pasta(s) compartilhada(s)" : " item(ns)") + (count != total ? " de " + total : "") + (browserTruncated ? " · limite de 1.000 itens; refine a organização da pasta" : "") + (browserError != 0 ? " · consulta com erro" : ""));
             C<ScrollViewer>("ShareEmptyHost").Visibility = empty ? Visibility.Visible : Visibility.Collapsed;

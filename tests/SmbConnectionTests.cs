@@ -70,7 +70,7 @@ internal static class SmbConnectionTests
             fake.Pages.Enqueue(new[] { Row(@"\\192.168.1.2\IPC$", null) });
             SmbConnectionSnapshot snapshot = SmbConnections.ListServerConnections("192.168.1.2", fake);
             Check(snapshot.Success && snapshot.Connections.Count == 2 && fake.Enumerations == 2 && fake.Frees == 2, "Paged enum failed or buffers leaked");
-            Check(snapshot.Connections[0].UserName == "Milena" && snapshot.Connections[0].DomainName == "MicrosoftAccount", "Credential identity missing");
+            Check(snapshot.Connections[0].UserName == "FixtureUser" && snapshot.Connections[0].DomainName == "MicrosoftAccount", "Credential identity missing");
             Check(snapshot.Connections[1].ReferenceCount == 1 && fake.Canceled.Count == 0, "Read-only listing changed a connection");
 
             fake = new FakeNative();
